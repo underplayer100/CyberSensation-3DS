@@ -18,6 +18,6 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 robocopy "$root\sd\3ds\fnf3ds\cyber" "$stage\3ds\fnf3ds\cyber" /E /XF scores.txt *.bmp log.txt /NFL /NDL /NJH /NJS /NP | Out-Null
 $zip = "$rel\CyberSensation-3DS-SD.zip"
 if (Test-Path $zip) { Remove-Item $zip }
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-[IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
+# Python's zipfile writes standard "/" paths (Windows PowerShell 5.1 would write "\", which breaks other unzip tools)
+py -3 -c "import shutil, sys; shutil.make_archive(sys.argv[1][:-4], 'zip', sys.argv[2])" $zip $stage
 Get-ChildItem $rel | Select-Object Name, @{n = "MB"; e = { [math]::Round($_.Length / 1MB) } }
