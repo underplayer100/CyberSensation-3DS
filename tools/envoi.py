@@ -47,7 +47,9 @@ def main():
         for attempt in range(6):
             try:
                 same = False
-                always = remote.endswith((".cia", ".3dsx")) or "/ui/" in remote or "/tex/ui_" in remote                     or "/tex/menu_" in remote or remote.endswith("songs.lst")
+                # a converted file can change without changing size: only the (big, rarely changed) audio is
+                # skipped when the size matches
+                always = not remote.endswith(".adp")
                 if not always:
                     try:
                         same = f.size(remote) == size
