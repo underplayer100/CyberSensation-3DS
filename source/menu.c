@@ -29,7 +29,8 @@ static u32 auto_down(void) {
         {1260, KEY_A}, {1340, 0},
         /* Options > Touches : L ajouté à Gauche, puis touches par défaut */
         {1360, KEY_DDOWN}, {1375, KEY_DDOWN}, {1390, KEY_A}, {1460, 0}, {1480, KEY_A}, {1520, 0}, {1540, KEY_L},
-        {1580, 0}, {1600, KEY_DUP}, {1620, KEY_A}, {1660, 0}, {1680, KEY_B}, {1700, KEY_B}, {1740, -1u}};
+        {1580, 0}, {1600, KEY_DUP}, {1615, KEY_DUP}, {1630, KEY_A}, {1660, 0}, {1680, KEY_A}, {1720, KEY_ZL},
+        {1750, 0}, {1770, KEY_DUP}, {1790, KEY_A}, {1830, 0}, {1850, KEY_B}, {1870, KEY_B}, {1910, -1u}};
     f++;
     for (unsigned i = 0; i < sizeof(SCRIPT) / sizeof(SCRIPT[0]); i++) {
         if (SCRIPT[i].frame != f) continue;
@@ -143,6 +144,21 @@ static void textf(C2D_Font font, float x, float y, float size, int align, uint32
     C2D_TextGetDimensions(&t, sc, sc, &w, &h);
     float px = FX(x) - (align == 1 ? w / 2 : align == 2 ? w : 0);
     C2D_DrawText(&t, C2D_WithColor, px, FY(y), 0.9f, sc, sc, color);
+}
+
+/* textf avec un contour sombre de 1 pixel écran : lisible sur les barres claires du freeplay */
+static void textfo(C2D_Font font, float x, float y, float size, int align, uint32_t color, float alpha, const char* fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (alpha <= 0.01f) return;
+    uint32_t dark = C2D_Color32(12, 10, 40, (int)(230 * (alpha > 1 ? 1 : alpha)));
+    float o = 1.0f / MS;   /* 1 pixel de l'écran 3DS en unités FNF */
+    static const int D[8][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+    for (int k = 0; k < 8; k++) textf(font, x + D[k][0] * o, y + D[k][1] * o, size, align, dark, "%s", buf);
+    textf(font, x, y, size, align, color, "%s", buf);
 }
 
 static uint32_t rgba(int r, int g, int b, float a) {
@@ -505,17 +521,26 @@ static void keys_screen(void) {
                 sfx("cancel");
             }
         } else {
-            if (down & KEY_DUP) sel = (sel + 4) % 5, sfx("scroll");
-            if (down & KEY_DDOWN) sel = (sel + 1) % 5, sfx("scroll");
+            /* lignes : 4 flèches, "Tout effacer", "Touches par défaut" */
+            if (down & KEY_DUP) sel = (sel + 5) % 6, sfx("scroll");
+            if (down & KEY_DDOWN) sel = (sel + 1) % 6, sfx("scroll");
             if (down & KEY_A) {
                 if (sel < 4) {
                     listening = true;
                     listenTime = 0;
+                } else if (sel == 4) {
+                    /* pour repartir de zéro : ensuite un bouton par flèche */
+                    memset(gSettings.laneKeys, 0, sizeof(gSettings.laneKeys));
+                    sel = 0;
                 } else {
                     memcpy(gSettings.laneKeys, DEF, sizeof(DEF));
                     settings_save();
                 }
                 sfx("confirm");
+            }
+            if ((down & KEY_X) && sel < 4) {
+                gSettings.laneKeys[sel] = 0;   /* vide cette flèche */
+                sfx("cancel");
             }
             if (down & KEY_B) {
                 /* flèche sans bouton : reprend ses touches par défaut qui ne servent pas ailleurs */
@@ -538,8 +563,8 @@ static void keys_screen(void) {
             C2D_DrawImage(sBgImg, &p, NULL);
         }
         textf(fFree, 640, 50, 56, 1, C2D_Color32(255, 255, 255, 255), "TOUCHES");
-        for (int i = 0; i < 5; i++) {
-            float y = 180 + i * 95;
+        for (int i = 0; i < 6; i++) {
+            float y = 160 + i * 88;
             uint32_t c = i == sel ? C2D_Color32(255, 255, 255, 255) : C2D_Color32(255, 255, 255, 130);
             if (i < 4) {
                 char ks[160];
@@ -550,7 +575,7 @@ static void keys_screen(void) {
                     wait ? C2D_Color32(247, 1, 116, 255) : C2D_Color32(2, 244, 240, i == sel ? 255 : 160), "%s",
                     wait ? "Appuie sur un bouton..." : ks);
             } else {
-                textf(fVcr, 120, y, 40, 0, c, "Touches par defaut");
+                textf(fVcr, 120, y, 40, 0, c, "%s", i == 4 ? "Tout effacer" : "Touches par defaut");
             }
             if (i == sel) C2D_DrawRectSolid(FX(120), FY(y + 48), 0.5f, FX(1040), 2, C2D_Color32(247, 1, 116, 255));
         }
@@ -558,7 +583,8 @@ static void keys_screen(void) {
         if (listening)
             bottom_info("Touches", "Appuie sur un bouton pour l'ajouter", "ou le retirer s'il y est deja (START : annuler)");
         else
-            bottom_info("Touches", "A : ajouter/retirer un bouton   B : retour", "Un bouton ne sert qu'a une seule fleche");
+            bottom_info("Touches", sel < 4 ? "A : ajouter/retirer   X : vider   B : retour" : "A : valider   B : retour",
+                sel == 4 ? "Vide les 4 fleches, puis donne 1 bouton a chacune" : "Un bouton ne sert qu'a une seule fleche");
         C3D_FrameEnd(0);
         bg_update(osGetTime() / 1000.0f);
     }
@@ -765,15 +791,22 @@ static void story_screen(void) {
         }
         const SprFrame* tf = frame_of(&sTitle, "fade", 0);
         if (tf) img(tf, 0, -100, 1, 0.4f, 0);
-        textf(fVcr, 640, tw_get(&chapY), 64, 1, C2D_Color32(255, 255, 255, 255), "%s", ch->name);
-        textf(fVcr, 640, tw_get(&descY), 48, 1, C2D_Color32(255, 255, 255, 255), "%s", ch->desc);
+        /* transition() du mod : le titre et la description du chapitre s'effacent quand on choisit main/side */
+        if (!pick) {
+            textf(fVcr, 640, tw_get(&chapY), 64, 1, C2D_Color32(255, 255, 255, 255), "%s", ch->name);
+            textf(fVcr, 640, tw_get(&descY), 48, 1, C2D_Color32(255, 255, 255, 255), "%s", ch->desc);
+        }
         if (pick || tw_get(&sideY) < 719) {
             float sy = tw_get(&sideY);
-            C2D_DrawRectSolid(0, 0, 0.6f, 400, 240, rgba(0, 0, 0, 0.6f * (1 - sy / 720)));
+            /* même profondeur que img() : à 0,6 le voile masquait les images main/side dessinées ensuite */
+            C2D_DrawRectSolid(0, 0, 0.5f, 400, 240, rgba(0, 0, 0, 0.6f * (1 - sy / 720)));
             const SprFrame* m = frame_of(&sStory, "side_main", 0);
             const SprFrame* sd = frame_of(&sStory, "side_side", 0);
-            if (m) img(m, 40, 150 + sy, pickSel == 0 ? 0.8f : 0.7f, pickSel == 0 ? 1 : 0.5f, 0);
-            if (sd) img(sd, 640, 150 + sy, pickSel == 1 ? 0.8f : 0.7f, pickSel == 1 ? 1 : 0.5f, 0);
+            /* StoryMenuState : images 2000x1838 à l'échelle 0,4 (sans updateHitbox après), main en (-733, -514),
+               side en (-14, -494) ; mise à l'échelle autour du centre -> coin à x + 1000 * 0,6, y + 919 * 0,6.
+               La sélectionnée est opaque, l'autre à moitié transparente. */
+            if (m) img(m, -733 + 600, -514 + 551.4f + sy, 1, pickSel == 0 ? 1 : 0.5f, 0);
+            if (sd) img(sd, -14 + 600, -494 + 551.4f + sy, 1, pickSel == 1 ? 1 : 0.5f, 0);
             textf(fVcr, 640, 30 + sy, 64, 1, C2D_Color32(255, 255, 255, 255), "PICK A STORY");
             textf(fVcr, 330, 620 + sy, 40, 1, pickSel == 0 ? C2D_Color32(2, 244, 240, 255) : C2D_Color32(180, 180, 180, 255),
                 "MAIN STORY");
@@ -967,7 +1000,7 @@ static void freeplay_screen(void) {
             }
             SongEntry* s = &sSongs[f->first];
             float ts = tw_get(&f->ts);
-            textf(fFree, tw_get(&f->tx), ty, 42 * ts, 0, rgba(255, 255, 255, al), "%s", s->baseName);
+            textfo(fFree, tw_get(&f->tx), ty, 46 * ts, 0, rgba(255, 255, 255, al), al, "%s", s->baseName);
             int ia = spr_anim(&sIcons, s->icon);
             if (ia >= 0) {
                 const SprFrame* ic = &sIcons.frames[sIcons.anims[ia].frames[0]];
@@ -980,14 +1013,15 @@ static void freeplay_screen(void) {
             if (c) img(c, tw_get(&coverX[k]), tw_get(&coverY[k]), 1, tw_get(&coverA[k]), tw_get(&coverR[k]));
         }
         SongEntry* s = &sSongs[it[cur].first + curDiff];
+        float da = tw_get(&diffA);
         if (it[cur].count > 1)
-            textf(fFree, 1050, tw_get(&diffY), 24, 0, rgba(255, 255, 255, tw_get(&diffA)), "< %s >", s->diff);
+            textfo(fFree, 1050, tw_get(&diffY), 30, 0, rgba(255, 230, 80, da), da, "< %s >", s->diff);
         else
-            textf(fFree, 1050, tw_get(&diffY), 24, 0, rgba(255, 255, 255, tw_get(&diffA)), "%s", s->diff);
+            textfo(fFree, 1050, tw_get(&diffY), 30, 0, rgba(255, 230, 80, da), da, "%s", s->diff);
         img(frame_of(&sUi, "freeplay_overlay", 0), 0, 0, 1, 1, 0);
-        textf(fFree, 10, 10, 42, 0, C2D_Color32(255, 255, 255, 255), "%s - %s", s->baseName, s->diff);
-        textf(fFree, 10, 53, 32, 0, C2D_Color32(255, 255, 255, 255), "%s", s->composer);
-        textf(fFree, 10, 720 - 46, 32, 0, C2D_Color32(255, 255, 255, 255), "PERSONAL BEST: %d", best_get(s->id));
+        textfo(fFree, 10, 10, 44, 0, C2D_Color32(255, 255, 255, 255), 1, "%s - %s", s->baseName, s->diff);
+        textfo(fFree, 10, 56, 36, 0, C2D_Color32(255, 255, 255, 255), 1, "%s", s->composer);
+        textfo(fFree, 10, 720 - 50, 36, 0, C2D_Color32(255, 255, 255, 255), 1, "PERSONAL BEST: %d", best_get(s->id));
         fade_draw(dt);
 
         C2D_TargetClear(sBottom, C2D_Color32(14, 12, 30, 255));
