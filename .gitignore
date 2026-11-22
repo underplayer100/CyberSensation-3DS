@@ -1,0 +1,16 @@
+# build output
+build/
+*.elf
+*.3dsx
+*.smdh
+*.cia
+*.exe
+*.log
+
+# converted mod data (game assets: never commit them)
+sd/
+
+# generated from the mod's art by tools/make_meta.py
+meta/banner.*
+meta/icon.*
+meta/romfs/
