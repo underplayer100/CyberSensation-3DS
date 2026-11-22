@@ -192,6 +192,11 @@ void hud_text(float x, float y, float size, int align, uint32_t color, bool outl
 }
 
 /* ---------------------------------------------------------------- scores */
+/* dans le dossier du mod sur la SD ; si le mod est dans le romfs du .cia (lecture seule), sur la SD à côté */
+static void scores_path(char* p, size_t n) {
+    if (strncmp(gModDir, "romfs:", 6) == 0) snprintf(p, n, "sdmc:/3ds/fnf3ds/scores.txt");
+    else snprintf(p, n, "%s/scores.txt", gModDir);
+}
 typedef struct {
     char id[64];
     int score;
@@ -201,7 +206,7 @@ static int sBestCount;
 
 static void scores_load(void) {
     char p[320];
-    snprintf(p, sizeof(p), "%s/scores.txt", gModDir);
+    scores_path(p, sizeof(p));
     FILE* f = fopen(p, "r");
     sBest = calloc(128, sizeof(Best));
     sBestCount = 0;
@@ -234,7 +239,7 @@ static void best_set(const char* id, int score) {
     if (score <= sBest[i].score) return;
     sBest[i].score = score;
     char p[320];
-    snprintf(p, sizeof(p), "%s/scores.txt", gModDir);
+    scores_path(p, sizeof(p));
     FILE* f = fopen(p, "w");
     if (!f) return;
     for (int k = 0; k < sBestCount; k++) fprintf(f, "%s|%d\n", sBest[k].id, sBest[k].score);

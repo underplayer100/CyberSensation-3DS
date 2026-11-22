@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -146,6 +147,16 @@ static bool find_mod(void) {
     return found;
 }
 
+/* .cia complet : données converties dans le romfs (romfs:/cyber/...) ; un dossier sur la SD reste prioritaire */
+static bool find_mod_any(void) {
+    if (find_mod()) return true;
+    FILE* f = fopen("romfs:/cyber/songs.lst", "r");
+    if (!f) return false;
+    fclose(f);
+    snprintf(gModDir, sizeof(gModDir), "romfs:/cyber");
+    return true;
+}
+
 int main(void) {
     gfxInitDefault();
     osSetSpeedupEnable(true);
@@ -158,7 +169,10 @@ int main(void) {
     bool audioOk = R_SUCCEEDED(ndspInit());
     if (audioOk) ndspSetOutputMode(NDSP_OUTPUT_STEREO);
 
-    bool modOk = find_mod();
+    romfsInit();
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/fnf3ds", 0777);
+    bool modOk = find_mod_any();
     SongEntry* songs = NULL;
     int songCount = modOk ? load_songs(&songs) : 0;
     int sel = 0, scroll = 0;
@@ -166,7 +180,14 @@ int main(void) {
     FILE* at = fopen("sdmc:/3ds/fnf3ds/autotest.txt", "r");
     if (at) {
         char want[64] = "";
-        if (fscanf(at, "%63s %f", want, &gAutoSeconds) < 1) want[0] = 0;
+        /* "<chanson avec espaces> <secondes>" : le dernier mot est la durée */
+        if (!fgets(want, sizeof(want), at)) want[0] = 0;
+        want[strcspn(want, "\r\n")] = 0;
+        char* sp = strrchr(want, ' ');
+        if (sp) {
+            gAutoSeconds = (float)atof(sp + 1);
+            *sp = 0;
+        }
         fclose(at);
         if (strcmp(want, "menus") == 0) {
             extern bool gAutoMenu;

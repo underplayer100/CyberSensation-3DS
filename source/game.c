@@ -34,6 +34,7 @@ typedef struct {
     float stageX, stageY;   /* position donnée par la scène (setPosition) */
     float gx, gy;           /* décalage global du XML du personnage */
     bool flip, swapLR, isPlayer;
+    bool drawSwap;          /* isFlippedOffsets : swapLR, inversé si un script change flipX */
     int anim;
     float animTime;
     float holdTimer;        /* ms depuis la dernière note chantée */
@@ -42,7 +43,10 @@ typedef struct {
     int interval;
     float camx, camy;
     float baseW, baseH;     /* taille du premier cadre (monde) */
-    int aIdle, aLeft, aRight, aSing[4], aMiss[4];
+    float scale, ow, oh;    /* échelle du XML, origine Flixel (centre du 1er cadre de l'atlas, non mis à l'échelle) */
+    bool hidden;
+    int aIdle, aLeft, aRight, aSing[4], aMiss[4], aAlt[4];
+    bool alt;               /* événement Alt Animation Toggle */
     char noteSkin[32];
 } Character;
 
@@ -187,11 +191,15 @@ static bool char_load(Character* ch, const char* name, bool isPlayer) {
     bool flipX = spr_metaf(&ch->spr, "flipX", 0) != 0;
     ch->flip = flipX != isPlayer;            /* fixChar : if (isPlayer) flipX = !flipX */
     ch->swapLR = isPlayer != playerOffsets;  /* gauche/droite échangés, décalages en miroir */
+    ch->drawSwap = ch->swapLR;
     ch->holdTime = spr_metaf(&ch->spr, "holdTime", 4);
     ch->camx = spr_metaf(&ch->spr, "camx", 0);
     ch->camy = spr_metaf(&ch->spr, "camy", 0);
     ch->gx = spr_metaf(&ch->spr, "x", 0);
     ch->gy = spr_metaf(&ch->spr, "y", 0);
+    ch->scale = spr_metaf(&ch->spr, "scale", 1);
+    ch->ow = spr_metaf(&ch->spr, "ow", 0);
+    ch->oh = spr_metaf(&ch->spr, "oh", 0);
     snprintf(ch->noteSkin, sizeof(ch->noteSkin), "%s", spr_metas(&ch->spr, "notesprite", "default"));
     ch->aIdle = spr_anim(&ch->spr, "idle");
     ch->aLeft = spr_anim(&ch->spr, "danceLeft");
@@ -204,6 +212,8 @@ static bool char_load(Character* ch, const char* name, bool isPlayer) {
         ch->aSing[i] = spr_anim(&ch->spr, SING[src]);
         snprintf(m, sizeof(m), "%smiss", SING[src]);
         ch->aMiss[i] = spr_anim(&ch->spr, m);
+        snprintf(m, sizeof(m), "%s-alt", SING[src]);
+        ch->aAlt[i] = spr_anim(&ch->spr, m);
         if (ch->aSing[i] < 0) ch->aSing[i] = ch->aIdle;
     }
     int first = ch->aIdle >= 0 ? ch->aIdle : (ch->aRight >= 0 ? ch->aRight : 0);
@@ -247,9 +257,9 @@ static void char_beat(Character* ch, int beat, float stepCrochet, bool locked) {
     char_dance_now(ch);
 }
 
-static void char_sing(Character* ch, int lane, bool miss) {
+static void char_sing(Character* ch, int lane, bool miss, bool alt) {
     if (!ch->loaded) return;
-    int a = miss ? ch->aMiss[lane] : ch->aSing[lane];
+    int a = miss ? ch->aMiss[lane] : ((alt || ch->alt) && ch->aAlt[lane] >= 0) ? ch->aAlt[lane] : ch->aSing[lane];
     if (a < 0) a = ch->aSing[lane];
     char_play(ch, a);
     ch->singing = true;
@@ -282,7 +292,8 @@ static void draw_frame(const SprFrame* fr, float sx, float sy, float scale, bool
     float ox = flip ? (fr->fw - fr->ox - fr->sub.width) : fr->ox;
     float x0 = sx + ox * scale, y0 = sy + fr->oy * scale;
     if (x0 > SCREEN_W + 8 || x0 + w < -8 || y0 > SCREEN_H + 8 || y0 + h < -8) return;
-    C2D_DrawParams p = {.pos = {x0 + (flip ? w : 0), y0, flip ? -w : w, h}, .center = {0, 0}, .depth = 0.5f};
+    /* citro2d prend |w| à partir de pos.x : une largeur négative retourne l'image sur place */
+    C2D_DrawParams p = {.pos = {x0, y0, flip ? -w : w, h}, .center = {0, 0}, .depth = 0.5f};
     C2D_DrawImage(fr->img, &p, alpha < 1.0f ? &tint : NULL);
 }
 
@@ -296,21 +307,85 @@ static const SprFrame* anim_frame(const Spr* s, int anim, float timeMs, bool loo
     return &s->frames[a->frames[i]];
 }
 
+/* FlxSprite.drawFrameComplex : écran = pos - offset + origin + scale * (pixel - origin - frameOffset).
+   Le convertisseur a déjà multiplié frameOffset (a->ox, a->oy) par scale.
+   Décalages inversés (isFlippedOffsets) : flipX et scale.x sont niés pendant le dessin, ce qui
+   donne un cadre placé en miroir autour de l'origine avec frameOffset de signe opposé. */
 static void char_draw(const Character* ch, const Camera* cam) {
-    if (!ch->loaded) return;
+    if (!ch->loaded || ch->hidden) return;
     const SprFrame* fr = anim_frame(&ch->spr, ch->anim, ch->animTime, false);
     if (!fr) return;
     const SprAnim* a = &ch->spr.anims[ch->anim];
-    float ox = ch->swapLR ? -a->ox : a->ox;
+    float s = ch->scale, ow = ch->ow, oh = ch->oh;
+    float bx = ch->drawSwap ?ch->x + ow + s * ow + a->ox - fr->fw / WORLD_S : ch->x + ow - s * ow - a->ox;
+    float by = ch->y + oh - s * oh - a->oy;
     float sx, sy;
-    world_to_screen(cam, ch->x - ox, ch->y - a->oy, ch->scx, ch->scy, &sx, &sy);
+    world_to_screen(cam, bx, by, ch->scx, ch->scy, &sx, &sy);
     draw_frame(fr, sx, sy, cam->zoom, ch->flip, 1.0f);
 }
 
-/* getCameraPosition : milieu du personnage (position de scène) + (joueur ? -100 : 150) + décalages */
+/* getCameraPosition : getMidpoint (x + width / 2, width = frameWidth * scale après updateHitbox)
+   + (joueur ? -100 : 150) + globalOffset + cameraOffset */
 static void char_camera(const Character* ch, float* x, float* y) {
-    *x = ch->stageX + ch->baseW / 2 + (ch->isPlayer ? -100.0f : 150.0f) + ch->gx + ch->camx;
-    *y = ch->stageY + ch->baseH / 2 - 100.0f + ch->gy + ch->camy;
+    float hw = ch->ow > 0 ? ch->ow * ch->scale : ch->baseW / 2, hh = ch->oh > 0 ? ch->oh * ch->scale : ch->baseH / 2;
+    *x = ch->stageX + hw + (ch->isPlayer ? -100.0f : 150.0f) + ch->gx + ch->camx;
+    *y = ch->stageY + hh - 100.0f + ch->gy + ch->camy;
+}
+
+/* "slot <perso> <position>" de fix.txt : position de scène utilisée par chaque emplacement (0 bf, 1 dad, 2 gf) */
+static void read_slots(const char* songId, int posOf[3]) {
+    char path[384], line[96];
+    snprintf(path, sizeof(path), "%s/songs/%s/fix.txt", gModDir, songId);
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    int who, p;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "slot %d %d", &who, &p) == 2 && who >= 0 && who < 3 && p >= 0 && p < 3) posOf[who] = p;
+    fclose(f);
+}
+
+/* fix.txt : repositionnements simples extraits des scripts du décor et de la chanson */
+typedef struct {
+    bool on;
+    float x, y;
+} CamFix;
+
+static void apply_fixes(const char* songId, Character chars[3], float charPos[3][4], float* zoom, CamFix camFix[3]) {
+    char path[384], line[96];
+    snprintf(path, sizeof(path), "%s/songs/%s/fix.txt", gModDir, songId);
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        char op[8], kind[8];
+        int who;
+        float a, b;
+        if (sscanf(line, "pos %d %f %f", &who, &a, &b) == 3 && who >= 0 && who < 3) {
+            charPos[who][0] = a;
+            charPos[who][1] = b;
+        } else if (sscanf(line, "%7s %7s %d %f", op, kind, &who, &a) == 4 && who >= 0 && who < 3 &&
+                   (!strcmp(op, "set") || !strcmp(op, "add") || !strcmp(op, "sub"))) {
+            Character* c = &chars[who];
+            float* t = !strcmp(kind, "x") ? &charPos[who][0] : !strcmp(kind, "y") ? &charPos[who][1]
+                     : !strcmp(kind, "camx") ? &c->camx : !strcmp(kind, "camy") ? &c->camy : NULL;
+            if (!t) continue;
+            if (!strcmp(op, "set")) *t = a;
+            else *t += !strcmp(op, "add") ? a : -a;
+        } else if (sscanf(line, "flip %d %f", &who, &a) == 2 && who >= 0 && who < 3) {
+            /* flipX change après fixChar : l'image suit flipX, les décalages passent en miroir */
+            bool fl = a != 0;
+            if (fl != chars[who].flip) {
+                chars[who].flip = fl;
+                chars[who].drawSwap = !chars[who].drawSwap;
+            }
+        } else if (sscanf(line, "hide %d", &who) == 1 && who >= 0 && who < 3) {
+            chars[who].hidden = true;
+        } else if (sscanf(line, "zoom %f", &a) == 1) {
+            *zoom = a;
+        } else if (sscanf(line, "camfix %d %f %f", &who, &a, &b) == 3 && who >= 0 && who < 3) {
+            camFix[who] = (CamFix){true, a, b};
+        }
+    }
+    fclose(f);
 }
 
 /* ---------------------------------------------------------------- HUD (coordonnées FNF 1280x720) */
@@ -389,7 +464,7 @@ static void draw_hold(const Hud* h, const Spr* sk, int lane, float cx, float ySt
         float b0 = hy(h, bodyEnd), b1 = hy(h, yEnd);
         float top = b0 < b1 ? b0 : b1, ht = fabsf(b1 - b0);
         bool flipY = h->down;
-        C2D_DrawParams p = {.pos = {x - ef->sub.width * z / 2.0f, flipY ? top + ht : top, ef->sub.width * z, flipY ? -ht : ht},
+        C2D_DrawParams p = {.pos = {x - ef->sub.width * z / 2.0f, top, ef->sub.width * z, flipY ? -ht : ht},
             .depth = 0.5f};
         C2D_DrawImage(ef->img, &p, &tint);
     }
@@ -546,10 +621,17 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     stage_load(&stage, &stageCount, &stageZoom, charPos, chart.stage);
 
     Character chars[3];   /* 0 bf, 1 dad, 2 gf */
-    char_load(&chars[0], chart.chars[1], true);
-    char_load(&chars[1], chart.chars[0], false);
-    char_load(&chars[2], chart.chars[2], false);
-    for (int i = 0; i < 3; i++) char_place(&chars[i], charPos[i][0], charPos[i][1], charPos[i][2], charPos[i][3]);
+    /* isPlayer = stage.isCharFlipped(position) : vrai seulement à la position "boyfriend" */
+    int posOf[3] = {0, 1, 2};
+    read_slots(song->id, posOf);
+    char_load(&chars[0], chart.chars[1], posOf[0] == 0);
+    char_load(&chars[1], chart.chars[0], posOf[1] == 0);
+    char_load(&chars[2], chart.chars[2], posOf[2] == 0);
+    CamFix camFix[3] = {{false, 0, 0}, {false, 0, 0}, {false, 0, 0}};
+    float slotPos[3][4];
+    for (int i = 0; i < 3; i++) memcpy(slotPos[i], charPos[posOf[i]], sizeof(slotPos[i]));
+    apply_fixes(song->id, chars, slotPos, &stageZoom, camFix);
+    for (int i = 0; i < 3; i++) char_place(&chars[i], slotPos[i][0], slotPos[i][1], slotPos[i][2], slotPos[i][3]);
 
     /* flèches propres au personnage de chaque côté (notesprite) */
     char tex[320];
@@ -566,6 +648,8 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     const char* iconP = chars[0].loaded ? spr_metas(&chars[0].spr, "icon", "bf") : "bf";
     const char* iconD = chars[1].loaded ? spr_metas(&chars[1].spr, "icon", "dad") : "dad";
     int aIconP = spr_anim(&gIcons, iconP), aIconD = spr_anim(&gIcons, iconD);
+    if (aIconP < 0) aIconP = spr_anim(&gIcons, "face");   /* HealthIcon : icône absente -> face */
+    if (aIconD < 0) aIconD = spr_anim(&gIcons, "face");
 
     Stream inst, voices;
     snprintf(path, sizeof(path), "%s/songs/%s/inst.adp", gModDir, song->id);
@@ -576,6 +660,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     Camera cam = {0, 0, stageZoom};
     float camTX, camTY;
     char_camera(chars[1].loaded ? &chars[1] : &chars[0], &camTX, &camTY);
+    if (camFix[0].on) camTX = camFix[0].x, camTY = camFix[0].y;
     cam.x = camTX;
     cam.y = camTY;
     float hudZoom = 1.0f;
@@ -714,7 +799,13 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
             if (e->kind == 0) {
                 int t = (int)e->value;
                 Character* c = t == 1 ? &chars[0] : t == 2 ? &chars[2] : &chars[1];
-                if (c->loaded) char_camera(c, &camTX, &camTY);
+                int ti = t == 1 ? 1 : t == 2 ? 2 : 0;
+                if (camFix[ti].on) camTX = camFix[ti].x, camTY = camFix[ti].y;
+                else if (c->loaded) char_camera(c, &camTX, &camTY);
+            } else if (e->kind == 2) {
+                int v = (int)e->value, t = v / 2;
+                Character* c = t == 1 ? &chars[0] : t == 2 ? &chars[2] : &chars[1];
+                c->alt = (v & 1) != 0;
             }
         }
 
@@ -742,7 +833,8 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                 if (n->time > pos) break;
                 if (!n->hit) {
                     n->hit = true;
-                    char_sing(&chars[1], n->lane, false);
+                    if (n->type != 2)
+                        char_sing(n->type == 3 ? &chars[2] : n->type == 4 ? &chars[0] : &chars[1], n->lane, false, n->type == 1);
                     strums[0][n->lane].anim = 2;
                     strums[0][n->lane].time = 0;
                     if (haveVoices) stream_volume(&voices, 1.0f);
@@ -786,7 +878,9 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                         pressedNotes++;
                         accSum += a;
                         health += hg;
-                        char_sing(&chars[0], l, false);
+                        if (best->type != 2)
+                            char_sing(best->type == 3 ? &chars[2] : best->type == 4 ? &chars[1] : &chars[0], l, false,
+                                best->type == 1);
                         strums[1][l].anim = 2;
                         strums[1][l].time = 0;
                         if (haveVoices) stream_volume(&voices, 1.0f);
@@ -819,7 +913,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                             misses++;
                             combo = 0;
                             score -= 10;
-                            char_sing(&chars[0], l, true);
+                            char_sing(&chars[0], l, true, false);
                             miss_sound();
                         }
                     }
@@ -847,7 +941,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                     pressedNotes++;
                     health -= 0.0475f;
                     score -= 10;
-                    char_sing(&chars[0], n->lane, true);
+                    char_sing(&chars[0], n->lane, true, false);
                     if (haveVoices) stream_volume(&voices, 0.0f);
                     miss_sound();
                 }
@@ -974,12 +1068,15 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
             C2D_DrawRectSolid(hx(&hud, center), y0, 0.5f, (ix + iw - center) * WORLD_S * z, hh, C2D_Color32(102, 255, 51, 255));
             if (aIconD >= 0) {
                 float w = gIcons.frames[gIcons.anims[aIconD].frames[0]].fw / WORLD_S;
-                draw_centered(&hud, &gIcons, aIconD, health > 1.6f ? 1 : 0, center - (w - 26) + w / 2, barMid, iconScale, 1.0f,
-                    false);
+                int nD = gIcons.anims[aIconD].count;
+                int fD = health > 1.6f ? (nD > 1 ? 1 : 0) : (health < 0.4f && nD > 2) ? 2 : 0;
+                draw_centered(&hud, &gIcons, aIconD, fD, center - (w - 26) + w / 2, barMid, iconScale, 1.0f, false);
             }
             if (aIconP >= 0) {
                 float w = gIcons.frames[gIcons.anims[aIconP].frames[0]].fw / WORLD_S;
-                draw_centered(&hud, &gIcons, aIconP, health < 0.4f ? 1 : 0, center - 26 + w / 2, barMid, iconScale, 1.0f, true);
+                int nP = gIcons.anims[aIconP].count;
+                int fP = health < 0.4f ? (nP > 1 ? 1 : 0) : (health > 1.6f && nP > 2) ? 2 : 0;
+                draw_centered(&hud, &gIcons, aIconP, fP, center - 26 + w / 2, barMid, iconScale, 1.0f, true);
             }
             float acc = pressedNotes ? accSum / pressedNotes : -1;
             float ty = hud.down ? 720 - (by + 30) - 18 : by + 30;

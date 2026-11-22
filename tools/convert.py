@@ -71,6 +71,28 @@ def parse_sparrow(xml_path):
     return frames
 
 
+def parse_indices(txt):
+    """'[0,1,2]', '0..5', '0,2..4' -> liste d'entiers (comme CoolUtil.parseNumberRange)."""
+    nums = []
+    for part in (txt or "").strip("[] ").split(","):
+        part = part.strip()
+        if ".." in part:
+            lo, hi = part.split("..")
+            nums += list(range(int(float(lo)), int(float(hi)) + 1))
+        elif part:
+            nums.append(int(float(part)))
+    return nums
+
+
+def select_frames(frames, prefix, indices):
+    """addByPrefix ou addByIndices (indices = position dans la liste triée du préfixe, comme Flixel)."""
+    pref = prefix_frames(frames, prefix)
+    nums = parse_indices(indices)
+    if not nums:
+        return [i for _, i in pref]
+    return [pref[n][1] for n in nums if 0 <= n < len(pref)]
+
+
 def prefix_frames(frames, prefix):
     """Comme Flixel addByPrefix : cadres dont le nom commence par le préfixe, triés par numéro."""
     out = []
@@ -207,6 +229,174 @@ def load_png(path):
     return im.convert("RGBA")
 
 
+# ---------------------------------------------------------------- atlas Adobe Animate (FlxAnimate)
+
+class AnimateAtlas:
+    """Aplatit un atlas Animate (Animation.json + spritemapN) en images, comme le dessinerait FlxAnimate :
+    addBySymbol joue le symbole à la position du sprite (matrice identité), éléments composés récursivement."""
+
+    def __init__(self, folder):
+        folder = Path(folder)
+        self.data = json.loads((folder / "Animation.json").read_text(encoding="utf-8-sig"))
+        self.symbols = {s["SN"]: s["TL"] for s in self.data.get("SD", {}).get("S", [])}
+        self.parts = {}
+        for sm in sorted(folder.glob("spritemap*.json")):
+            atlas = json.loads(sm.read_text(encoding="utf-8-sig"))
+            img = load_png(folder / atlas["meta"]["image"])
+            for s in atlas["ATLAS"]["SPRITES"]:
+                s = s["SPRITE"]
+                if s["rotated"]:
+                    im = img.crop((s["x"], s["y"], s["x"] + s["h"], s["y"] + s["w"])).rotate(90, expand=True)
+                else:
+                    im = img.crop((s["x"], s["y"], s["x"] + s["w"], s["y"] + s["h"]))
+                self.parts[s["name"]] = im
+        self.fps = float(self.data.get("MD", {}).get("FRT", 24))
+
+    @staticmethod
+    def matrix(e):
+        m = e.get("M3D", [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+        if isinstance(m, dict):
+            m = [m.get(k, 0) for k in ("m00", "m01", "m02", "m03", "m10", "m11", "m12", "m13",
+                                        "m20", "m21", "m22", "m23", "m30", "m31", "m32", "m33")]
+        return (m[0], m[1], m[4], m[5], m[12], m[13])   # a, b, c, d, tx, ty
+
+    @staticmethod
+    def mul(p, c):  # p puis c : point -> c -> p
+        a, b, cc, d, tx, ty = p
+        a2, b2, c2, d2, tx2, ty2 = c
+        return (a * a2 + cc * b2, b * a2 + d * b2, a * c2 + cc * d2, b * c2 + d * d2,
+                a * tx2 + cc * ty2 + tx, b * tx2 + d * ty2 + ty)
+
+    @staticmethod
+    def length(tl):
+        return max((f["I"] + f["DU"] for l in tl["L"] for f in l["FR"]), default=1)
+
+    def collect(self, tl, frame, m, alpha, out, depth=0):
+        """Liste (image, matrice, alpha) dans l'ordre de dessin pour l'image `frame` d'une timeline."""
+        if depth > 32:
+            return
+        for layer in reversed(tl["L"]):  # le premier calque est au-dessus
+            for fr in layer["FR"]:
+                if fr["I"] <= frame < fr["I"] + fr["DU"]:
+                    for e in fr["E"]:
+                        if "ASI" in e:
+                            im = self.parts.get(e["ASI"]["N"])
+                            if im is not None:
+                                out.append((im, self.mul(m, self.matrix(e["ASI"])), alpha))
+                        elif "SI" in e:
+                            si = e["SI"]
+                            child = self.symbols.get(si.get("SN"))
+                            if child is None:
+                                continue
+                            n = self.length(child)
+                            local = frame - fr["I"]
+                            ff = int(si.get("FF", 0))
+                            lp = si.get("LP", "LP")
+                            if si.get("ST") in ("G", "graphic"):
+                                f2 = ff if lp == "SF" else (min(ff + local, n - 1) if lp == "PO" else (ff + local) % n)
+                            else:  # movieclip : joue sa propre timeline en boucle
+                                f2 = local % n
+                            a2 = alpha
+                            c = si.get("C") or {}
+                            if c.get("M") in ("CA", "Alpha"):
+                                a2 *= float(c.get("AM", 1))
+                            elif "AM" in c:
+                                a2 *= float(c["AM"])
+                            self.collect(child, f2, self.mul(m, self.matrix(si)), a2, out, depth + 1)
+                    break
+
+    def render(self, tl, frame):
+        """Image RGBA recadrée + position de son coin haut-gauche dans l'espace du symbole."""
+        items = []
+        self.collect(tl, frame, (1, 0, 0, 1, 0, 0), 1.0, items)
+        if not items:
+            return None
+        xs, ys = [], []
+        for im, (a, b, c, d, tx, ty), _ in items:
+            for px, py in ((0, 0), (im.width, 0), (0, im.height), (im.width, im.height)):
+                xs.append(a * px + c * py + tx)
+                ys.append(b * px + d * py + ty)
+        x0, y0 = int(min(xs)) - 1, int(min(ys)) - 1
+        w, h = int(max(xs)) + 2 - x0, int(max(ys)) + 2 - y0
+        canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        for im, (a, b, c, d, tx, ty), al in items:
+            det = a * d - b * c
+            if abs(det) < 1e-9:
+                continue
+            # inverse : coordonnée canevas -> coordonnée de la pièce
+            ia, ib, ic, id_ = d / det, -c / det, -b / det, a / det
+            ox, oy = tx - x0, ty - y0
+            coeffs = (ia, ib, -(ia * ox + ib * oy), ic, id_, -(ic * ox + id_ * oy))
+            layer = im.transform((w, h), Image.AFFINE, coeffs, resample=Image.BILINEAR)
+            if al < 1:
+                layer.putalpha(layer.getchannel("A").point(lambda v: int(v * al)))
+            canvas.alpha_composite(layer)
+        bb = canvas.getbbox()
+        if not bb:
+            return None
+        return canvas.crop(bb), x0 + bb[0], y0 + bb[1]
+
+    def timeline_for(self, name):
+        """Symbole du même nom, sinon étiquette de la timeline principale -> (timeline, début, fin)."""
+        tl = self.symbols.get(name)
+        if tl is None:
+            for k, v in self.symbols.items():
+                if k.strip() == name.strip():
+                    tl = v
+                    break
+        if tl is not None:
+            return tl, 0, self.length(tl)
+        main = self.data["AN"]["TL"]
+        for layer in main["L"]:
+            for fr in layer["FR"]:
+                if fr.get("N") == name:
+                    return main, fr["I"], fr["I"] + fr["DU"]
+        return None
+
+
+def convert_animate_character(name, root, folder, scale):
+    """Personnage en atlas Animate -> cadres ordinaires (frameOffset/frameWidth communs à tout l'atlas)."""
+    print("  personnage (atlas Animate)", name)
+    atlas = AnimateAtlas(folder)
+    baked = []   # (nom anim, fps, loop, x, y, [(image, gauche, haut)])
+    cache = {}
+    for an in root.iter("anim"):
+        p = an.attrib
+        found = atlas.timeline_for(p.get("anim", ""))
+        if not found:
+            continue
+        tl, start, end = found
+        nums = parse_indices(p.get("indices"))
+        frames_idx = [start + n for n in nums if start + n < end] if nums else list(range(start, end))
+        imgs = []
+        for f in frames_idx:
+            key = (id(tl), f)
+            if key not in cache:
+                cache[key] = atlas.render(tl, f)
+            if cache[key]:
+                imgs.append(cache[key])
+        if imgs:
+            baked.append((p["name"], float(p.get("fps", atlas.fps)), p.get("loop", "false") == "true",
+                          float(p.get("x", 0)), float(p.get("y", 0)), imgs))
+    if not baked:
+        return None
+    # boîte commune : coin haut-gauche de tous les cadres = origine des décalages
+    minx = min(x for b in baked for _, x, _ in b[5])
+    miny = min(y for b in baked for _, _, y in b[5])
+    maxx = max(x + im.width for b in baked for im, x, _ in b[5])
+    maxy = max(y + im.height for b in baked for im, _, y in b[5])
+    ss = SpriteSet("chr_" + re.sub(r"\W", "_", name), S * scale)
+    for an_name, fps, loop, ox, oy, imgs in baked:
+        idx = []
+        for im, x, y in imgs:
+            f = {"x": 0, "y": 0, "w": im.width, "h": im.height, "fx": int(minx - x), "fy": int(miny - y),
+                 "fw": int(maxx - minx), "fh": int(maxy - miny), "rot": False}
+            idx.append(ss.add_frame(im, f))
+        # le symbole est dessiné à la position du sprite : le coin de la boîte est donc à (minx, miny)
+        ss.add_anim(an_name, fps, loop, (ox - minx) * scale, (oy - miny) * scale, idx)
+    return ss, (maxx - minx) / 2, (maxy - miny) / 2
+
+
 # ---------------------------------------------------------------- personnages
 
 def convert_character(name, done):
@@ -223,41 +413,48 @@ def convert_character(name, done):
     scale = float(a.get("scale", 1))
     png = find_asset(f"images/characters/{sprite}.png")
     sx = find_asset(f"images/characters/{sprite}.xml")
-    if png is None or sx is None:
+    animate = find_asset(f"images/characters/{sprite}/Animation.json")
+    if (png is None or sx is None) and animate is None:
         print("  image introuvable pour", name)
         done[name] = None
         return None
     if SKIP_DONE and (OUT / "chars" / f"{name}.spr").exists():
         done[name] = {"icon": a.get("icon", name), "notesprite": a.get("notesprite", "default")}
         return done[name]
-    print("  personnage", name)
-    src = load_png(png)
-    frames = parse_sparrow(sx)
-    ss = SpriteSet("chr_" + re.sub(r"\W", "_", name), S * scale)
+    if png is None or sx is None:
+        res = convert_animate_character(name, root, animate.parent, scale)
+        if res is None:
+            print("  atlas Animate vide pour", name)
+            done[name] = None
+            return None
+        ss, ow, oh = res
+        frames = [{"fw": ow * 2, "fh": oh * 2}]
+    else:
+        print("  personnage", name)
+        src = load_png(png)
+        frames = parse_sparrow(sx)
+        ss = SpriteSet("chr_" + re.sub(r"\W", "_", name), S * scale)
+        add_character_anims(ss, root, src, frames, scale)
+    finish_character(ss, name, a, scale, frames)
+    done[name] = ss.meta
+    return ss.meta
+
+
+def add_character_anims(ss, root, src, frames, scale):
     for an in root.iter("anim"):
         p = an.attrib
-        pref = prefix_frames(frames, p["anim"])
-        if not pref:
+        if "anim" not in p:
             continue
-        ind = (p.get("indices") or "").strip("[] ")
-        if ind:
-            bynum = {n: i for n, i in pref}
-            nums = []
-            for part in ind.split(","):
-                part = part.strip()
-                if ".." in part:
-                    lo, hi = part.split("..")
-                    nums += list(range(int(lo), int(hi) + 1))
-                elif part:
-                    nums.append(int(part))
-            sel = [bynum[n] for n in nums if n in bynum]
-        else:
-            sel = [i for _, i in pref]
+        sel = select_frames(frames, p["anim"], p.get("indices"))
         if not sel:
             continue
         idx = [ss.add_frame(src, frames[i]) for i in sel]
+        # frameOffset de Flixel : appliqué avant l'échelle, donc multiplié par scale
         ss.add_anim(p["name"], float(p.get("fps", 24)), p.get("loop", "false") == "true",
-                    float(p.get("x", 0)), float(p.get("y", 0)), idx)
+                    float(p.get("x", 0)) * scale, float(p.get("y", 0)) * scale, idx)
+
+
+def finish_character(ss, name, a, scale, frames):
     ss.meta = {
         "isPlayer": 1 if a.get("isPlayer", "false") == "true" else 0,
         "flipX": 1 if a.get("flipX", "false") == "true" else 0,
@@ -269,13 +466,210 @@ def convert_character(name, done):
         "notesprite": a.get("notesprite", "default"),
         "interval": float(a.get("interval", 0)),
         "color": a.get("color", ""),
+        # origine Flixel = centre du premier cadre de l'atlas (taille source, non mise à l'échelle)
+        "ow": frames[0]["fw"] / 2 if frames else 0, "oh": frames[0]["fh"] / 2 if frames else 0,
+        "offs": 1,  # décalages d'animation déjà multipliés par scale
     }
     ss.write(OUT / "chars" / f"{name}.spr")
-    done[name] = ss.meta
-    return ss.meta
 
 
 # ---------------------------------------------------------------- décors
+
+def build_stage_sprite(ssname, src, frames, anims, scale):
+    """Sprite de décor -> SpriteSet. anims : [(nom, préfixe, indices, fps, boucle, x, y)].
+    Renvoie (ss, origine x, origine y, réduction appliquée pour tenir dans une page 3DS)."""
+    ss = SpriteSet(ssname, S * scale)
+    fit = 1.0
+    ow, oh = src.width / 2, src.height / 2
+    if frames:
+        ow, oh = frames[0]["fw"] / 2, frames[0]["fh"] / 2
+        for an_name, prefix, indices, fps, loop, x, y in anims:
+            sel = select_frames(frames, prefix, indices)
+            if sel:
+                idx = [ss.add_frame(src, frames[i]) for i in sel[:64]]
+                ss.add_anim(an_name, fps, loop, x * scale, y * scale, idx)
+        if not ss.anims:
+            # Codename : sans <anim>, une animation "idle" avec tous les cadres
+            ss.add_anim("idle", 24, True, 0, 0, [ss.add_frame(src, f) for f in frames[:64]])
+    else:
+        # image fixe : réduite davantage si elle dépasse une page 3DS
+        w, h = src.width * S * scale, src.height * S * scale
+        if w > PAGE - PAD or h > PAGE - PAD:
+            fit = min((PAGE - PAD) / w, (PAGE - PAD) / h)
+            ss.scale *= fit
+        ss.add_anim("idle", 24, True, 0, 0, [ss.add_image(src)])
+    return ss, ow, oh, fit
+
+
+def safe_num(expr):
+    expr = (expr or "").strip()
+    if not expr or not re.fullmatch(r"[-+*/(). \d]+", expr):
+        return None
+    try:
+        return float(eval(expr, {"__builtins__": {}}))
+    except Exception:
+        return None
+
+
+class ScriptSprite:
+    """État Flixel minimal d'un sprite créé par script (position, échelle, hitbox, défilement...)."""
+
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+        self.path = None       # image (sans extension), relative à images/
+        self.atlas = False
+        self.anims = []
+        self.play = None
+        self.sx = self.sy = 1.0
+        self.fw = self.fh = 0.0
+        self.width = self.height = 0.0
+        self.offx = self.offy = 0.0
+        self.scx = self.scy = 1.0
+        self.alpha = 1.0
+        self.flip = False
+        self.visible = True
+        self.hud = False
+
+    def load(self, path, atlas):
+        self.path, self.atlas = path, atlas
+        png = find_asset(f"images/{path}.png")
+        if png is None:
+            self.path = None
+            return
+        sx = find_asset(f"images/{path}.xml") if atlas else None
+        if sx:
+            fr = parse_sparrow(sx)
+            self.fw, self.fh = (fr[0]["fw"], fr[0]["fh"]) if fr else (0, 0)
+        else:
+            self.atlas = False
+            with Image.open(png) as im:
+                self.fw, self.fh = im.size
+        self.width, self.height = self.fw, self.fh
+
+
+CHARNAME = {"boyfriend": "boyfriend", "bf": "boyfriend", "dad": "dad", "gf": "girlfriend", "girlfriend": "girlfriend"}
+EXPR = r"([^,()]+(?:\([^()]*\)[^,()]*)*)"
+
+
+def sprite_statement(o, rest):
+    """Applique une instruction 'nom.<rest>' à un ScriptSprite."""
+    E = EXPR
+    if (g := re.match(r"loadGraphic\(Paths\.image\(['\"](.+?)['\"]\)", rest)):
+        o.load(g.group(1), False)
+    elif (g := re.match(r"frames = Paths\.getSparrowAtlas\(['\"](.+?)['\"]\)", rest)):
+        o.load(g.group(1), True)
+    elif (g := re.match(r"animation\.addByPrefix\(['\"](.+?)['\"] ?, ?['\"](.+?)['\"](?: ?, ?" + NUM + r")?(?: ?, ?(true|false))?", rest)):
+        o.anims.append((g.group(1), g.group(2), None, float(g.group(3) or 24), g.group(4) != "false", 0, 0))
+    elif (g := re.match(r"animation\.addByIndices\(['\"](.+?)['\"] ?, ?['\"](.+?)['\"] ?, ?\[(.*?)\][^,]*,[^,]*(?:, ?" + NUM + r")?(?: ?, ?(true|false))?", rest)):
+        o.anims.append((g.group(1), g.group(2), g.group(3), float(g.group(4) or 24), g.group(5) == "true", 0, 0))
+    elif (g := re.match(r"animation\.play\(['\"](.+?)['\"]", rest)):
+        o.play = g.group(1)
+    elif (g := re.fullmatch(r"scale\.set\(" + E + r"(?:, ?" + E + r")?\)", rest)):
+        a, b = safe_num(g.group(1)), safe_num(g.group(2)) if g.group(2) else None
+        if a is not None:
+            o.sx, o.sy = a, b if b is not None else a
+    elif (g := re.fullmatch(r"scale\.([xy]) ?= ?" + E, rest)) and safe_num(g.group(2)) is not None:
+        setattr(o, "s" + g.group(1), safe_num(g.group(2)))
+    elif (g := re.fullmatch(r"setGraphicSize\(" + E + r"(?:, ?" + E + r")?\)", rest)):
+        w, h = safe_num(g.group(1)), (safe_num(g.group(2)) if g.group(2) else 0) or 0
+        if w is not None and o.fw and o.fh:
+            o.sx = w / o.fw if w > 0 else h / o.fh
+            o.sy = h / o.fh if h > 0 else o.sx
+    elif rest.startswith("updateHitbox("):
+        o.width, o.height = o.fw * abs(o.sx), o.fh * abs(o.sy)
+        o.offx, o.offy = -0.5 * (o.width - o.fw), -0.5 * (o.height - o.fh)
+    elif (g := re.fullmatch(r"screenCenter\((.*)\)", rest)):
+        ax = g.group(1).replace("FlxAxes.", "").strip()
+        if ax in ("", "XY", "X"):
+            o.x = (1280 - o.width) / 2
+        if ax in ("", "XY", "Y"):
+            o.y = (720 - o.height) / 2
+    elif (g := re.fullmatch(r"scrollFactor\.set\(" + E + r"(?:, ?" + E + r")?\)", rest)):
+        a, b = safe_num(g.group(1)), safe_num(g.group(2)) if g.group(2) else None
+        if a is not None:
+            o.scx, o.scy = a, b if b is not None else a
+    elif (g := re.fullmatch(r"scrollFactor\.([xy]) ?= ?" + E, rest)) and safe_num(g.group(2)) is not None:
+        setattr(o, "sc" + g.group(1), safe_num(g.group(2)))
+    elif (g := re.fullmatch(r"setPosition\(" + E + r", ?" + E + r"\)", rest)):
+        a, b = safe_num(g.group(1)), safe_num(g.group(2))
+        if a is not None and b is not None:
+            o.x, o.y = a, b
+    elif (g := re.fullmatch(r"([xy]) ?([-+]?=) ?" + E, rest)) and safe_num(g.group(3)) is not None:
+        v = safe_num(g.group(3))
+        cur = getattr(o, g.group(1))
+        setattr(o, g.group(1), v if g.group(2) == "=" else cur + v if g.group(2) == "+=" else cur - v)
+    elif (g := re.fullmatch(r"alpha ?= ?" + E, rest)) and safe_num(g.group(1)) is not None:
+        o.alpha = safe_num(g.group(1))
+    elif rest.replace(" ", "") == "flipX=true":
+        o.flip = True
+    elif rest.replace(" ", "") == "visible=false":
+        o.visible = False
+    elif rest.replace(" ", "") == "visible=true":
+        o.visible = True
+    elif rest.startswith("cameras") and "camGame" not in rest:
+        o.hud = True
+
+
+def run_stage_script(src, objects, order):
+    """Exécute les créations de sprites simples de create/postCreate.
+    objects : nom -> ScriptSprite ou clé de sprite XML ; order : liste ('char', tag) / ('spr', clé)."""
+    src = strip_comments(src)
+    idxvars = {}
+
+    def key_of(name):
+        if name in CHARNAME:
+            return ("char", CHARNAME[name])
+        if name in objects:
+            return ("spr", name)
+        return None
+
+    def put(k, before):
+        if k in order:
+            order.remove(k)
+        if before in order:
+            order.insert(order.index(before), k)
+        else:
+            order.append(k)
+
+    for fn in ("create", "postCreate"):
+        for st in executed(function_body(src, fn), {}):
+            st = re.sub(r"\s+", " ", st).strip()
+            st = re.sub(r"^var ", "", st)
+            m = re.fullmatch(r"(\w+)(?: ?: ?\w+)? = members\.indexOf\((\w+)\)", st)
+            if m:
+                idxvars[m.group(1)] = key_of(m.group(2))
+                continue
+            m = re.match(r"(\w+)(?: ?: ?\w+)? = new (?:FunkinSprite|FlxSprite)\((.*?)\)(.*)$", st)
+            if m:
+                args = [safe_num(v) for v in m.group(2).split(",")] if m.group(2).strip() else []
+                o = ScriptSprite(args[0] if args and args[0] is not None else 0,
+                                 args[1] if len(args) > 1 and args[1] is not None else 0)
+                objects[m.group(1)] = o
+                # appels chaînés : new FlxSprite(...).loadGraphic(...)
+                for call in re.findall(r"\.(\w+\(.*?\)\)?)(?=\.|$)", m.group(3)):
+                    sprite_statement(o, call)
+                continue
+            m = re.match(r"(\w+)\.(.*)$", st)
+            if m and isinstance(objects.get(m.group(1)), ScriptSprite):
+                sprite_statement(objects[m.group(1)], m.group(2))
+                continue
+            m = re.fullmatch(r"add\((\w+)\)", st)
+            if m and isinstance(objects.get(m.group(1)), ScriptSprite):
+                put(("spr", m.group(1)), None)
+                continue
+            m = re.fullmatch(r"insert\((.+?), ?(\w+)\)", st)
+            if m and key_of(m.group(2)):
+                where = m.group(1).strip()
+                g = re.fullmatch(r"members\.indexOf\((\w+)\)", where)
+                before = key_of(g.group(1)) if g else idxvars.get(where)
+                put(key_of(m.group(2)), before)
+                continue
+            m = re.fullmatch(r"remove\((\w+)\)", st)
+            if m and m.group(1) in CHARNAME:
+                k = ("char", CHARNAME[m.group(1)])
+                if k in order:
+                    order.remove(k)
+
 
 def convert_stage(name, done):
     if name in done:
@@ -284,27 +678,28 @@ def convert_stage(name, done):
     if SKIP_DONE and (OUT / "stages" / f"{name}.stg").exists():
         return
     xml = find_asset(f"data/stages/{name}.xml")
-    if xml is None:
+    hx = find_asset(f"data/stages/{name}.hx")
+    if xml is None and hx is None:
         print("  décor introuvable:", name)
         return
     print("  décor", name)
-    root = ET.fromstring(re.sub(r"<!DOCTYPE[^>]*>", "", xml.read_text(encoding="utf-8-sig")))
+    if xml is not None:
+        root = ET.fromstring(re.sub(r"<!DOCTYPE[^>]*>", "", xml.read_text(encoding="utf-8-sig")))
+    else:
+        root = ET.fromstring("<stage/>")
     folder = root.attrib.get("folder", "")
     if folder and not folder.endswith("/"):
         folder += "/"
-    zoom = float(root.attrib.get("zoom", 1.0))
-    sprites = []
+    zoom = float(root.attrib.get("zoom", 1.05))
+    records = {}  # clé -> (nom spr, x, y, scx, scy, 1/fit, alpha, flip)
     chars = {"boyfriend": (770, 100, 1, 1), "dad": (100, 100, 1, 1), "girlfriend": (400, 130, 0.95, 0.95)}
-    order = []  # éléments dans l'ordre : ('spr', i) ou ('char', nom)
+    order = []    # ('char', nom) ou ('spr', clé)
+    objects = {}  # nom de sprite (attribut name du XML ou variable du script) -> ScriptSprite / clé
+    sname = re.sub(r"\W", "_", name)
     for el in root:
         tag = el.tag
         a = el.attrib
-        if tag in ("boyfriend", "bf", "player"):
-            tag = "boyfriend"
-        if tag in ("girlfriend", "gf"):
-            tag = "girlfriend"
-        if tag in ("dad", "opponent"):
-            tag = "dad"
+        tag = {"bf": "boyfriend", "player": "boyfriend", "gf": "girlfriend", "opponent": "dad"}.get(tag, tag)
         if tag in chars:
             base = chars[tag]
             sc = a.get("scroll")
@@ -312,7 +707,7 @@ def convert_stage(name, done):
                           float(sc if sc else a.get("scrollx", base[2])), float(sc if sc else a.get("scrolly", base[3])))
             order.append(("char", tag))
             continue
-        if tag != "sprite":
+        if tag not in ("sprite", "spr", "sparrow"):
             continue
         spr = a.get("sprite")
         if not spr:
@@ -322,38 +717,58 @@ def convert_stage(name, done):
             continue
         sxml = find_asset(f"images/{folder}{spr}.xml")
         scale = float(a.get("scale", 1))
-        src = load_png(png)
-        sid = len(sprites)
-        ss = SpriteSet(f"stg_{re.sub(r'\W', '_', name)}_{sid}", S * scale)
-        fit = 1.0
-        if sxml is not None:
-            frames = parse_sparrow(sxml)
-            anims = [c.attrib for c in el if c.tag == "anim"]
-            if anims:
-                for an in anims:
-                    pref = prefix_frames(frames, an.get("anim", ""))
-                    if pref:
-                        idx = [ss.add_frame(src, frames[i]) for _, i in pref]
-                        ss.add_anim(an.get("name", "idle"), float(an.get("fps", 24)),
-                                    an.get("loop", "true") != "false", float(an.get("x", 0)),
-                                    float(an.get("y", 0)), idx)
-            if not ss.anims and frames:
-                idx = [ss.add_frame(src, f) for f in frames[:1]]
-                ss.add_anim("idle", 24, True, 0, 0, idx)
-        else:
-            # image fixe : réduite davantage si elle dépasse une page 3DS
-            w, h = src.width * S * scale, src.height * S * scale
-            if w > PAGE - PAD or h > PAGE - PAD:
-                fit = min((PAGE - PAD) / w, (PAGE - PAD) / h)
-                ss.scale *= fit
-            ss.add_anim("idle", 24, True, 0, 0, [ss.add_image(src)])
+        anims = [(c.get("name", "idle"), c.get("anim", ""), c.get("indices"), float(c.get("fps", 24)),
+                  c.get("loop", "true") != "false", float(c.get("x", 0)), float(c.get("y", 0)))
+                 for c in el if c.tag == "anim"]
+        ss, ow, oh, fit = build_stage_sprite(f"stg_{sname}_{len(records)}", load_png(png),
+                                             parse_sparrow(sxml) if sxml else None, anims, scale)
         ss.write(OUT / "stages" / f"{ss.name}.spr")
         sc = a.get("scroll")
         scx = float(sc if sc else a.get("scrollx", 1))
         scy = float(sc if sc else a.get("scrolly", 1))
-        sprites.append((ss.name, float(a.get("x", 0)), float(a.get("y", 0)), scx, scy,
-                        1.0 / fit, float(a.get("alpha", 1)), 1 if a.get("flipX") == "true" else 0))
-        order.append(("spr", sid))
+        # Flixel met à l'échelle autour du centre (origin) ; updateHitbox="true" annule ce décalage
+        px, py = float(a.get("x", 0)), float(a.get("y", 0))
+        if a.get("updateHitbox") != "true":
+            px += ow * (1 - scale)
+            py += oh * (1 - scale)
+        key = a.get("name") or f"#{len(records)}"
+        records[key] = (ss.name, px, py, scx, scy, 1.0 / fit, float(a.get("alpha", 1)),
+                        1 if a.get("flipX") == "true" else 0)
+        objects[key] = key
+        order.append(("spr", key))
+    if hx is not None:
+        run_stage_script(hx.read_text(encoding="utf-8-sig", errors="replace"), objects, order)
+        for var, o in objects.items():
+            if not isinstance(o, ScriptSprite) or ("spr", var) not in order:
+                continue
+            if o.path is None or o.hud or not o.visible or o.alpha <= 0.01:
+                order.remove(("spr", var))
+                continue
+            png = find_asset(f"images/{o.path}.png")
+            sxml = find_asset(f"images/{o.path}.xml") if o.atlas else None
+            frames = parse_sparrow(sxml) if sxml else None
+            anims = sorted(o.anims, key=lambda t: t[0] != o.play) if o.play else list(o.anims)
+            s = abs(o.sx) or 1.0
+            sy = abs(o.sy) or s
+            try:
+                img = load_png(png)
+                if frames is None and abs(sy - s) > 1e-3:
+                    # échelle non uniforme : l'image est étirée d'avance, le SpriteSet garde une échelle unique
+                    img = img.resize((img.width, max(1, round(img.height * sy / s))), Image.LANCZOS)
+                ss, ow, oh, fit = build_stage_sprite(f"stg_{sname}_{len(records)}", img, frames, anims, s)
+                if frames is None:
+                    oh = o.fh / 2
+                ss.write(OUT / "stages" / f"{ss.name}.spr")
+            except Exception as ex:
+                print(f"    sprite de script {var} ignoré ({ex})")
+                order.remove(("spr", var))
+                continue
+            # écran = x - offset + origin + scale * (pixel - origin)
+            px = o.x - o.offx + ow * (1 - s)
+            py = o.y - o.offy + oh * (1 - (abs(o.sy) or s))
+            records[var] = (ss.name, px, py, o.scx, o.scy, 1.0 / fit, min(o.alpha, 1.0), 1 if o.flip else 0)
+            print(f"    sprite de script {var} ({o.path})")
+    order = [k for k in order if k[0] == "char" or k[1] in records]
     b = bytearray(b"FSTG") + struct.pack("<If", 1, zoom)
     for k in ("boyfriend", "dad", "girlfriend"):
         b += struct.pack("<ffff", *chars[k])
@@ -363,10 +778,246 @@ def convert_stage(name, done):
             b += struct.pack("<B", 1) + fstr({"boyfriend": "bf", "dad": "dad", "girlfriend": "gf"}[v]) + \
                 struct.pack("<ffffffB", 0, 0, 0, 0, 0, 0, 0)
         else:
-            n, x, y, scx, scy, sc, al, fl = sprites[v]
+            n, x, y, scx, scy, sc, al, fl = records[v]
             b += struct.pack("<B", 0) + fstr(n) + struct.pack("<ffffffB", x, y, scx, scy, sc, al, fl)
     (OUT / "stages").mkdir(parents=True, exist_ok=True)
     (OUT / "stages" / f"{name}.stg").write_bytes(b)
+
+
+# ---------------------------------------------------------------- scripts HScript (cas simples)
+
+WHO = {"boyfriend": 0, "bf": 0, "dad": 1, "gf": 2, "girlfriend": 2}
+NUM = r"(-?\d+(?:\.\d+)?)"
+
+
+def strip_comments(src):
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    return re.sub(r"//[^\n]*", "", src)
+
+
+def function_body(src, name):
+    m = re.search(r"function\s+" + name + r"\s*\([^)]*\)[^{]*\{", src)
+    if not m:
+        return ""
+    depth, i = 1, m.end()
+    while i < len(src) and depth:
+        depth += {"{": 1, "}": -1}.get(src[i], 0)
+        i += 1
+    return src[m.end():i - 1]
+
+
+def _balanced(src, i, open_ch, close_ch):
+    """src[i] == open_ch -> indice juste après la fermeture correspondante."""
+    depth = 0
+    while i < len(src):
+        if src[i] == open_ch:
+            depth += 1
+        elif src[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        elif src[i] in "'\"":
+            q = src[i]
+            i += 1
+            while i < len(src) and src[i] != q:
+                i += 1
+        i += 1
+    return len(src)
+
+
+def eval_condition(cond, ctx):
+    """Conditions simples sur le nom de la chanson / des persos ; None si on ne sait pas évaluer."""
+    c = cond
+    for k, v in ctx.items():
+        c = c.replace(k, repr(v))
+    c = c.replace("||", " or ").replace("&&", " and ").replace("|", " or ")
+    c = re.sub(r"!(?!=)", " not ", c)
+    bare = re.sub(r"'[^']*'|\"[^\"]*\"", "''", c)
+    if any(w not in ("or", "and", "not", "True", "False") for w in re.findall(r"[A-Za-z_]\w*", bare)):
+        return None
+    try:
+        return bool(eval(c, {"__builtins__": {}}))
+    except Exception:
+        return None
+
+
+def executed(body, ctx):
+    """Instructions exécutées d'un bloc : suit les if/else dont la condition est connue (ctx),
+    ignore boucles, switch, fonctions locales et conditions inconnues."""
+    out, i, n = [], 0, len(body)
+    while i < n:
+        while i < n and body[i] in " \t\r\n;":
+            i += 1
+        if i >= n:
+            break
+        m = re.match(r"if\s*\(", body[i:])
+        if m:
+            p = i + m.end() - 1
+            end = _balanced(body, p, "(", ")")
+            ok = eval_condition(body[p + 1:end - 1], ctx)
+            j = end
+            while j < n and body[j] in " \t\r\n":
+                j += 1
+            if j < n and body[j] == "{":
+                bend = _balanced(body, j, "{", "}")
+                block = body[j + 1:bend - 1]
+            else:
+                bend = body.find(";", j)
+                bend = n if bend < 0 else bend + 1
+                block = body[j:bend]
+            if ok:
+                out += executed(block, ctx)
+            i = bend
+            em = re.match(r"\s*else\b", body[i:])
+            if em:
+                k = i + em.end()
+                while k < n and body[k] in " \t\r\n":
+                    k += 1
+                if re.match(r"if\s*\(", body[k:]):
+                    # else if : toute la suite de la chaîne n'est prise que si la condition est fausse
+                    if ok is False:
+                        out += executed(body[k:], ctx)
+                        return out
+                    # condition vraie ou inconnue : saute le reste de la chaîne
+                    body, n, i = body[k:], len(body) - k, 0
+                    pm = re.match(r"if\s*\(", body)
+                    j = _balanced(body, pm.end() - 1, "(", ")")
+                    while j < n and body[j] in " \t\r\n":
+                        j += 1
+                    i = _balanced(body, j, "{", "}") if j < n and body[j] == "{" else body.find(";", j) + 1
+                    while True:
+                        em = re.match(r"\s*else\b\s*", body[i:])
+                        if not em:
+                            break
+                        k = i + em.end()
+                        if re.match(r"if\s*\(", body[k:]):
+                            pm = re.match(r"if\s*\(", body[k:])
+                            j = _balanced(body, k + pm.end() - 1, "(", ")")
+                            while j < n and body[j] in " \t\r\n":
+                                j += 1
+                            i = _balanced(body, j, "{", "}") if j < n and body[j] == "{" else body.find(";", j) + 1
+                        else:
+                            i = _balanced(body, k, "{", "}") if body[k:k + 1] == "{" else body.find(";", k) + 1
+                            break
+                elif k < n and body[k] == "{":
+                    bend = _balanced(body, k, "{", "}")
+                    if ok is False:
+                        out += executed(body[k + 1:bend - 1], ctx)
+                    i = bend
+                else:
+                    bend = body.find(";", k)
+                    bend = n if bend < 0 else bend + 1
+                    if ok is False:
+                        out += executed(body[k:bend], ctx)
+                    i = bend
+            continue
+        # instruction ordinaire ; un bloc { } (for, switch, fonction locale...) est sauté en entier
+        j, depth = i, 0
+        while j < n:
+            ch = body[j]
+            if ch in "'\"":
+                q = ch
+                j += 1
+                while j < n and body[j] != q:
+                    j += 1
+            elif ch in "({[":
+                depth += 1
+            elif ch in ")}]":
+                depth -= 1
+                if depth == 0 and ch == "}" and not re.match(r"\s*[.,)]", body[j + 1:]):
+                    j += 1
+                    break
+            elif ch == ";" and depth == 0:
+                break
+            j += 1
+        st = body[i:j].strip()
+        if st and "{" not in st and not re.match(r"(for|while|switch|else|function|return)\b", st):
+            out.append(st)
+        i = j + 1
+    return out
+
+
+def top_level(body):
+    """Instructions qui ne sont dans aucun bloc (if, for, switch, fonction locale...)."""
+    out, depth, cur = [], 0, ""
+    for ch in body:
+        if ch == "{":
+            depth += 1
+            cur = ""
+        elif ch == "}":
+            depth -= 1
+            cur = ""
+        elif ch == ";":
+            if depth == 0:
+                out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    # une instruction précédée de "if (...)" sans accolades n'est pas toujours exécutée
+    return [s for s in out if not re.match(r"(if|else|for|while)\b", s)]
+
+
+def script_fixes(src, ctx=None):
+    """Repositionnements, zoom et caméra fixes faits par un script de décor ou de chanson."""
+    src = strip_comments(src)
+    phases = {}
+    for fn in ("create", "postCreate"):
+        res = phases.setdefault(fn, [])
+        for st in executed(function_body(src, fn), ctx or {}):
+            st = re.sub(r"\s+", " ", st)
+            m = re.fullmatch(r"(\w+)\.flipX ?= ?(true|false)", st)
+            if m and m.group(1) in WHO:
+                res.append(f"flip {WHO[m.group(1)]} {1 if m.group(2) == 'true' else 0}")
+                continue
+            m = re.fullmatch(r"(\w+)\.setPosition\( ?" + NUM + r" ?, ?" + NUM + r" ?\)", st)
+            if m and m.group(1) in WHO:
+                res.append(f"pos {WHO[m.group(1)]} {m.group(2)} {m.group(3)}")
+                continue
+            m = re.fullmatch(r"(\w+)\.(cameraOffset\.)?([xy]) ?([-+]?=) ?" + NUM, st)
+            if m and m.group(1) in WHO:
+                kind = ("cam" if m.group(2) else "") + m.group(3)
+                op = {"=": "set", "+=": "add", "-=": "sub"}[m.group(4)]
+                res.append(f"{op} {kind} {WHO[m.group(1)]} {m.group(5)}")
+                continue
+            m = re.fullmatch(r"(\w+)\.visible ?= ?false", st)
+            if m and m.group(1) in WHO:
+                res.append(f"hide {WHO[m.group(1)]}")
+                continue
+            m = re.fullmatch(r"defaultCamZoom ?= ?" + NUM, st)
+            if m:
+                res.append(f"zoom {m.group(1)}")
+    # zoom fixé au compte à rebours (souvent dans le onComplete d'un tween) : il gagne sur create
+    res = phases.setdefault("countdown", [])
+    for fn in ("onCountdown", "onStartCountdown", "onSongStart"):
+        z = re.findall(r"defaultCamZoom\s*=\s*" + NUM, function_body(src, fn))
+        if z:
+            res.append(f"zoom {z[-1]}")
+    # caméra fixe par cible : switch (curCameraTarget) { case 0: camFollow.setPosition(x, y); ... }
+    for fn in ("update", "postUpdate"):
+        body = function_body(src, fn)
+        sw = re.search(r"switch\s*\(\s*curCameraTarget\s*\)\s*\{", body)
+        if not sw:
+            continue
+        for m in re.finditer(r"case\s+(\d+)\s*:\s*camFollow\.setPosition\(\s*" + NUM + r"\s*,\s*" + NUM + r"\s*\)",
+                             body[sw.end():]):
+            res.append(f"camfix {m.group(1)} {m.group(2)} {m.group(3)}")
+        break
+    return phases
+
+
+def song_fixes(song_dir, stage, ctx):
+    """Ordre de Codename : create du décor puis des chansons, postCreate idem (approché par fichier)."""
+    files = []
+    st = find_asset(f"data/stages/{stage}.hx")
+    if st:
+        files.append(st)
+    files += sorted((song_dir / "scripts").glob("*.hx")) if (song_dir / "scripts").is_dir() else []
+    per = [script_fixes(f.read_text(encoding="utf-8-sig", errors="replace"), ctx) for f in files]
+    out = []
+    for phase in ("create", "postCreate", "countdown"):
+        for p in per:
+            out += p.get(phase, [])
+    return out
 
 
 # ---------------------------------------------------------------- audio
@@ -428,13 +1079,16 @@ def convert_song(song_dir, chars_done, stages_done, chart_p):
     stage = d.get("stage", "stage")
     lines = d["strumLines"]
 
-    def line(t):
-        for s in lines:
-            if s.get("type") == t:
-                return s
-        return None
+    # PlayState : dad = strumLines[0], boyfriend = strumLines[1], gf = strumLines[2] (par indice, pas par type),
+    # chacun à la position de sa ligne ("dad", "boyfriend", "girlfriend"). Les lignes suivantes sont ignorées.
+    def slot_of(idx):
+        if 0 <= idx < min(3, len(lines)):
+            return idx
+        t = lines[idx].get("type", 0) if 0 <= idx < len(lines) else 0
+        return {0: 0, 1: 1}.get(t, 2)
 
-    dad, bf, gf = line(0), line(1), line(2)
+    slots = [lines[i] if i < len(lines) else None for i in range(3)]
+    dad, bf, gf = slots
     names = []
     for s, default in ((dad, "dad"), (bf, "bf"), (gf, "gf")):
         names.append((s.get("characters") or [default])[0] if s else "")
@@ -450,25 +1104,60 @@ def convert_song(song_dir, chars_done, stages_done, chart_p):
         n, p = e["name"], e.get("params", [])
         if n == "Camera Movement" and p:
             # paramètre = indice de la ligne de notes visée
-            idx = int(p[0])
-            t = lines[idx].get("type", 0) if 0 <= idx < len(lines) else 0
-            events.append((float(e["time"]), 0, float(t)))
+            events.append((float(e["time"]), 0, float(slot_of(int(p[0])))))
         elif n == "BPM Change" and p:
             events.append((float(e["time"]), 1, float(p[0])))
         elif n == "Alt Animation Toggle" and p:
-            events.append((float(e["time"]), 2, 1.0 if p[0] else 0.0))
+            # params : [ligne de notes, chant alternatif activé, (idle alternatif)] -> type * 2 + activé
+            ints = [v for v in p if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            bools = [v for v in p if isinstance(v, bool)]
+            t = slot_of(int(ints[0]) if ints else 0)
+            events.append((float(e["time"]), 2, float(t * 2 + (1 if bools and bools[0] else 0))))
     events.sort()
+
+    # type de note (indice dans noteTypes, 1 = premier) -> 0 normal, 1 alt, 2 sans animation, 3 chantée par gf
+    ntypes = d.get("noteTypes", [])
+    tcode = {"Alt Animation": 1, "Alt Anim Note": 1, "No Animation": 2, "GF Sing": 3}
 
     def notes_of(s):
         res = []
         for n in (s or {}).get("notes", []):
             lane = int(n.get("id", 0))
+            ti = int(n.get("type", 0))
+            code = tcode.get(ntypes[ti - 1], 0) if 0 < ti <= len(ntypes) else 0
             if 0 <= lane < 4:
-                res.append((float(n["time"]), lane, int(n.get("type", 0)), float(n.get("sLen", 0))))
+                res.append((float(n["time"]), lane, code, float(n.get("sLen", 0))))
         res.sort()
         return res
 
-    nd, nb = notes_of(dad), notes_of(bf)
+    # toutes les lignes jouées par le joueur (type 1) d'un côté, toutes les lignes CPU de l'autre ;
+    # chanteur : 0 perso du côté, 3 emplacement gf, 4 perso de l'autre côté, 2 personne (perso non chargé)
+    nd, nb = [], []
+    for idx, s in enumerate(lines):
+        t = s.get("type", 0)
+        side = 1 if t == 1 else 0
+        sl = idx if idx < 3 else None
+        notes = notes_of(s)
+        if sl == side:
+            pass
+        elif sl == 2:
+            notes = [(a, l, 3, h) for a, l, _, h in notes]
+        elif sl is not None:
+            notes = [(a, l, 4, h) for a, l, _, h in notes]
+        else:
+            notes = [(a, l, 2, h) for a, l, _, h in notes]
+        (nb if side else nd).extend(notes)
+
+    def dedupe(ns):  # lignes parallèles : une seule note par instant et par flèche
+        out, seen = [], set()
+        for n in sorted(ns):
+            k = (round(n[0]), n[1])
+            if k not in seen:
+                seen.add(k)
+                out.append(n)
+        return out
+
+    nd, nb = dedupe(nd), dedupe(nb)
     b = bytearray(b"FSNG") + struct.pack("<Iff", 1, bpm, float(d.get("scrollSpeed", 1)))
     b += fstr(stage) + fstr(names[0]) + fstr(names[1]) + fstr(names[2])
     b += fstr(display, 48)
@@ -478,6 +1167,31 @@ def convert_song(song_dir, chars_done, stages_done, chart_p):
     for t, k, v in events:
         b += struct.pack("<fBxxxf", t, k, v)
     (out / "chart.sng").write_bytes(b)
+
+    fixes = []
+    # position de scène de chaque emplacement (indice du jeu : 0 bf, 1 dad, 2 gf)
+    pos_idx = {"boyfriend": 0, "bf": 0, "player": 0, "dad": 1, "opponent": 1, "girlfriend": 2, "gf": 2}
+    for slot, game_idx in ((0, 1), (1, 0), (2, 2)):
+        s = slots[slot]
+        if s and s.get("position") and pos_idx.get(s["position"], game_idx) != game_idx:
+            fixes.append(f"slot {game_idx} {pos_idx[s['position']]}")
+    ctx = {"PlayState.SONG.meta.displayName": meta.get("displayName", song_dir.name),
+           "PlayState.SONG.meta.name": meta.get("name", song_dir.name),
+           "SONG.meta.displayName": meta.get("displayName", song_dir.name),
+           "SONG.meta.name": meta.get("name", song_dir.name),
+           "PlayState.difficulty": diff, "dad.curCharacter": names[0], "boyfriend.curCharacter": names[1],
+           "gf.curCharacter": names[2]}
+    for f in song_fixes(song_dir, stage, ctx):
+        p = f.split()
+        if p[0] == "camfix":  # indice de ligne de notes -> emplacement (0 adversaire, 1 joueur, 2 gf)
+            p[1] = str(slot_of(int(p[1])))
+        fixes.append(" ".join(p))
+    fx = out / "fix.txt"
+    if fixes:
+        fx.write_text("\n".join(fixes) + "\n", encoding="ascii")
+        print("  script:", "; ".join(fixes))
+    elif fx.exists():
+        fx.unlink()
 
     songf = song_dir / "song"
     inst = songf / f"Inst-{diff}.ogg"
@@ -650,16 +1364,17 @@ def convert_menus():
 
 
 def convert_icons(names):
+    # HealthIcon : images carrées (côté = hauteur) : normale, perd, (gagne) ; icône absente -> "face"
     ss = SpriteSet("ui_icons", S)
-    for n in sorted(set(x for x in names if x)):
+    for n in sorted(set(x for x in names if x) | {"face"}):
         p = find_asset(f"images/icons/{n}.png") or find_asset(f"images/icons/icon-{n}.png")
         if p is None:
+            print("  icône introuvable (remplacée par face):", n)
             continue
         im = load_png(p)
-        half = im.width // 2 if im.width >= im.height * 2 else im.width
-        idx = [ss.add_image(im.crop((0, 0, half, im.height)))]
-        if half < im.width:
-            idx.append(ss.add_image(im.crop((half, 0, half * 2, im.height))))
+        side = im.height
+        count = max(1, im.width // side) if side else 1
+        idx = [ss.add_image(im.crop((k * side, 0, (k + 1) * side, side))) for k in range(min(count, 3))]
         ss.add_anim(n, 0, False, 0, 0, idx)
     ss.write(OUT / "ui" / "icons.spr", "rgba8")
 
@@ -681,8 +1396,10 @@ def main():
     lst = MOD / "data" / "freeplaySonglist.txt"
     if lst.exists():
         order = [l.strip() for l in lst.read_text(encoding="utf-8-sig").splitlines() if l.strip()]
+    # Windows ignore la casse : "Karma" (liste) et "karma" (dossier) sont la même chanson
+    order = [s for i, s in enumerate(order) if s.lower() not in {o.lower() for o in order[:i]}]
     for p in sorted((MOD / "songs").iterdir()):
-        if p.is_dir() and p.name not in order:
+        if p.is_dir() and p.name.lower() not in {o.lower() for o in order}:
             order.append(p.name)
     entries = []
     for sid in order:

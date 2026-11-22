@@ -15,3 +15,5 @@ meta/banner.*
 meta/icon.*
 meta/romfs/
 release/
+
+test_all/
