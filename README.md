@@ -78,7 +78,8 @@ powershell -File tools/package_release.ps1                  # all release files 
 ## Controls
 | | |
 |---|---|
-| D-Pad / ABXY / Circle Pad | arrows (left, down, up, right) |
+| D-Pad / ABXY / Circle Pad | arrows (left, down, up, right), by default |
+| Options > Touches | choose the buttons of each arrow (A, B, X, Y, L, R, ZL, ZR, D-Pad, Circle Pad, C-Stick, SELECT) |
 | START | pause |
 | L / R | jump 5 songs in Freeplay |
 

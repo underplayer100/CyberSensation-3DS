@@ -89,9 +89,14 @@ typedef struct {
     int cover;
 } SongEntry;
 
+/* touches par défaut des 4 flèches (gauche, bas, haut, droite) */
+#define DEFAULT_LANE_KEYS {KEY_DLEFT | KEY_Y | KEY_CPAD_LEFT, KEY_DDOWN | KEY_B | KEY_CPAD_DOWN, \
+                           KEY_DUP | KEY_X | KEY_CPAD_UP, KEY_DRIGHT | KEY_A | KEY_CPAD_RIGHT}
+
 typedef struct {
     bool downscroll;
     bool ghostTapping;
+    u32 laneKeys[4];        /* boutons de chaque flèche, configurables dans Options > Touches */
 } Settings;
 extern Settings gSettings;
 

@@ -13,7 +13,7 @@
 #define FX(x) ((x) * MS)
 #define FY(y) (MY0 + (y) * MS)
 
-Settings gSettings = {false, true};
+Settings gSettings = {false, true, DEFAULT_LANE_KEYS};
 bool gAutoMenu = false;
 void screenshot(const char* path);
 
@@ -26,7 +26,10 @@ static u32 auto_down(void) {
         {120, 0}, {150, KEY_A}, {300, 0}, {320, KEY_DUP}, {360, KEY_A}, {480, 0}, {500, KEY_DRIGHT}, {560, 0},
         {580, KEY_A}, {700, 0}, {720, KEY_B}, {760, KEY_B}, {820, KEY_DDOWN}, {850, KEY_A}, {990, 0},
         {1000, KEY_DDOWN}, {1060, 0}, {1080, KEY_DRIGHT}, {1150, 0}, {1170, KEY_B}, {1230, KEY_DDOWN},
-        {1260, KEY_A}, {1340, 0}, {1360, -1u}};
+        {1260, KEY_A}, {1340, 0},
+        /* Options > Touches : L ajouté à Gauche, puis touches par défaut */
+        {1360, KEY_DDOWN}, {1375, KEY_DDOWN}, {1390, KEY_A}, {1460, 0}, {1480, KEY_A}, {1520, 0}, {1540, KEY_L},
+        {1580, 0}, {1600, KEY_DUP}, {1620, KEY_A}, {1660, 0}, {1680, KEY_B}, {1700, KEY_B}, {1740, -1u}};
     f++;
     for (unsigned i = 0; i < sizeof(SCRIPT) / sizeof(SCRIPT[0]); i++) {
         if (SCRIPT[i].frame != f) continue;
@@ -250,6 +253,8 @@ static void settings_save(void) {
     FILE* f = fopen("sdmc:/3ds/fnf3ds/settings.txt", "w");
     if (!f) return;
     fprintf(f, "downscroll=%d\nghost=%d\n", gSettings.downscroll, gSettings.ghostTapping);
+    fprintf(f, "keys=%lx,%lx,%lx,%lx\n", (unsigned long)gSettings.laneKeys[0], (unsigned long)gSettings.laneKeys[1],
+        (unsigned long)gSettings.laneKeys[2], (unsigned long)gSettings.laneKeys[3]);
     fclose(f);
 }
 static void settings_load(void) {
@@ -260,6 +265,10 @@ static void settings_load(void) {
         int v;
         if (sscanf(line, "downscroll=%d", &v) == 1) gSettings.downscroll = v;
         if (sscanf(line, "ghost=%d", &v) == 1) gSettings.ghostTapping = v;
+        unsigned long k[4];
+        if (sscanf(line, "keys=%lx,%lx,%lx,%lx", &k[0], &k[1], &k[2], &k[3]) == 4)
+            for (int i = 0; i < 4; i++)
+                if (k[i]) gSettings.laneKeys[i] = (u32)k[i];
     }
     fclose(f);
 }
@@ -438,6 +447,123 @@ static void play_list(const char** bases, int n, const char* storyId) {
 }
 
 /* ---------------------------------------------------------------- options */
+/* boutons qu'on peut donner aux flèches (START reste la pause) */
+static const struct {
+    u32 key;
+    const char* name;
+} BINDABLE[] = {
+    {KEY_A, "A"}, {KEY_B, "B"}, {KEY_X, "X"}, {KEY_Y, "Y"}, {KEY_L, "L"}, {KEY_R, "R"}, {KEY_ZL, "ZL"}, {KEY_ZR, "ZR"},
+    {KEY_DLEFT, "Croix G"}, {KEY_DDOWN, "Croix B"}, {KEY_DUP, "Croix H"}, {KEY_DRIGHT, "Croix D"},
+    {KEY_CPAD_LEFT, "Stick G"}, {KEY_CPAD_DOWN, "Stick B"}, {KEY_CPAD_UP, "Stick H"}, {KEY_CPAD_RIGHT, "Stick D"},
+    {KEY_CSTICK_LEFT, "C-Stick G"}, {KEY_CSTICK_DOWN, "C-Stick B"}, {KEY_CSTICK_UP, "C-Stick H"},
+    {KEY_CSTICK_RIGHT, "C-Stick D"}, {KEY_SELECT, "SELECT"},
+};
+#define BINDABLE_N ((int)(sizeof(BINDABLE) / sizeof(BINDABLE[0])))
+
+static void keys_list(u32 mask, char* out, size_t n) {
+    out[0] = 0;
+    for (int i = 0; i < BINDABLE_N; i++)
+        if (mask & BINDABLE[i].key) {
+            size_t l = strlen(out);
+            snprintf(out + l, n - l, "%s%s", l ? " " : "", BINDABLE[i].name);
+        }
+    if (!out[0]) snprintf(out, n, "-");
+}
+
+/* Options > Touches : A sur une flèche, puis appuyer sur un bouton pour l'ajouter (ou le retirer s'il y est déjà).
+   Un bouton ne sert qu'à une flèche : il est retiré des autres. Une flèche vide reprend ses touches par défaut. */
+static void keys_screen(void) {
+    static const char* LANE[4] = {"Gauche", "Bas", "Haut", "Droite"};
+    static const u32 DEF[4] = DEFAULT_LANE_KEYS;
+    int sel = 0;
+    bool listening = false;
+    float listenTime = 0;
+    u64 last = svcGetSystemTick();
+    sFade = 1;
+    while (aptMainLoop()) {
+        u64 now = svcGetSystemTick();
+        float dt = (float)((now - last) * 1000.0 / SYSCLOCK_ARM11);
+        last = now;
+        hidScanInput();
+        u32 down = auto_down();
+        audio_tick();
+        if (listening) {
+            listenTime += dt;
+            u32 k = 0;
+            for (int i = 0; i < BINDABLE_N && !k; i++)
+                if (down & BINDABLE[i].key) k = BINDABLE[i].key;
+            if (k && listenTime > 150) {
+                if (gSettings.laneKeys[sel] & k) gSettings.laneKeys[sel] &= ~k;
+                else {
+                    for (int l = 0; l < 4; l++) gSettings.laneKeys[l] &= ~k;
+                    gSettings.laneKeys[sel] |= k;
+                }
+                listening = false;
+                sfx("confirm");
+            } else if (down & KEY_START) {
+                listening = false;
+                sfx("cancel");
+            }
+        } else {
+            if (down & KEY_DUP) sel = (sel + 4) % 5, sfx("scroll");
+            if (down & KEY_DDOWN) sel = (sel + 1) % 5, sfx("scroll");
+            if (down & KEY_A) {
+                if (sel < 4) {
+                    listening = true;
+                    listenTime = 0;
+                } else {
+                    memcpy(gSettings.laneKeys, DEF, sizeof(DEF));
+                    settings_save();
+                }
+                sfx("confirm");
+            }
+            if (down & KEY_B) {
+                /* flèche sans bouton : reprend ses touches par défaut qui ne servent pas ailleurs */
+                u32 used = gSettings.laneKeys[0] | gSettings.laneKeys[1] | gSettings.laneKeys[2] | gSettings.laneKeys[3];
+                for (int l = 0; l < 4; l++)
+                    if (!gSettings.laneKeys[l]) gSettings.laneKeys[l] = DEF[l] & ~used;
+                for (int l = 0; l < 4; l++)
+                    if (!gSettings.laneKeys[l]) gSettings.laneKeys[l] = DEF[l];
+                settings_save();
+                sfx("cancel");
+                return;
+            }
+        }
+        C2D_TextBufClear(gTextBuf);
+        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+        C2D_TargetClear(sTop, C2D_Color32(0, 0, 0, 255));
+        C2D_SceneBegin(sTop);
+        if (sBgReady) {
+            C2D_DrawParams p = {.pos = {0, 0, 400, 240}, .depth = 0.1f};
+            C2D_DrawImage(sBgImg, &p, NULL);
+        }
+        textf(fFree, 640, 50, 56, 1, C2D_Color32(255, 255, 255, 255), "TOUCHES");
+        for (int i = 0; i < 5; i++) {
+            float y = 180 + i * 95;
+            uint32_t c = i == sel ? C2D_Color32(255, 255, 255, 255) : C2D_Color32(255, 255, 255, 130);
+            if (i < 4) {
+                char ks[160];
+                keys_list(gSettings.laneKeys[i], ks, sizeof(ks));
+                textf(fVcr, 120, y, 40, 0, c, "%s", LANE[i]);
+                bool wait = listening && i == sel;
+                textf(fVcr, 380, y + 2, 36, 0,
+                    wait ? C2D_Color32(247, 1, 116, 255) : C2D_Color32(2, 244, 240, i == sel ? 255 : 160), "%s",
+                    wait ? "Appuie sur un bouton..." : ks);
+            } else {
+                textf(fVcr, 120, y, 40, 0, c, "Touches par defaut");
+            }
+            if (i == sel) C2D_DrawRectSolid(FX(120), FY(y + 48), 0.5f, FX(1040), 2, C2D_Color32(247, 1, 116, 255));
+        }
+        fade_draw(dt);
+        if (listening)
+            bottom_info("Touches", "Appuie sur un bouton pour l'ajouter", "ou le retirer s'il y est deja (START : annuler)");
+        else
+            bottom_info("Touches", "A : ajouter/retirer un bouton   B : retour", "Un bouton ne sert qu'a une seule fleche");
+        C3D_FrameEnd(0);
+        bg_update(osGetTime() / 1000.0f);
+    }
+}
+
 static void options_screen(void) {
     int sel = 0;
     u64 last = svcGetSystemTick();
@@ -449,11 +575,16 @@ static void options_screen(void) {
         hidScanInput();
         u32 down = auto_down();
         audio_tick();
-        if (down & (KEY_DUP | KEY_DDOWN)) {
-            sel ^= 1;
-            sfx("scroll");
+        if (down & KEY_DUP) sel = (sel + 2) % 3, sfx("scroll");
+        if (down & KEY_DDOWN) sel = (sel + 1) % 3, sfx("scroll");
+        if (sel == 2 && (down & KEY_A)) {
+            sfx("confirm");
+            keys_screen();
+            sFade = 1;
+            last = svcGetSystemTick();
+            continue;
         }
-        if (down & (KEY_A | KEY_DLEFT | KEY_DRIGHT)) {
+        if (sel < 2 && (down & (KEY_A | KEY_DLEFT | KEY_DRIGHT))) {
             if (sel == 0) gSettings.downscroll = !gSettings.downscroll;
             else gSettings.ghostTapping = !gSettings.ghostTapping;
             sfx("confirm");
@@ -472,18 +603,23 @@ static void options_screen(void) {
             C2D_DrawImage(sBgImg, &p, NULL);
         }
         textf(fFree, 640, 80, 64, 1, C2D_Color32(255, 255, 255, 255), "OPTIONS");
-        const char* lab[2] = {"Downscroll", "Ghost tapping"};
+        const char* lab[3] = {"Downscroll", "Ghost tapping", "Touches"};
         bool val[2] = {gSettings.downscroll, gSettings.ghostTapping};
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 3; i++) {
             uint32_t c = i == sel ? C2D_Color32(255, 255, 255, 255) : C2D_Color32(255, 255, 255, 130);
-            textf(fVcr, 300, 280 + i * 110, 48, 0, c, "%s", lab[i]);
-            textf(fVcr, 980, 280 + i * 110, 48, 2, val[i] ? C2D_Color32(2, 244, 240, 255) : C2D_Color32(247, 1, 116, 255),
-                "%s", val[i] ? "OUI" : "NON");
-            if (i == sel) C2D_DrawRectSolid(FX(300), FY(280 + i * 110 + 56), 0.5f, FX(680), 2, C2D_Color32(247, 1, 116, 255));
+            textf(fVcr, 300, 260 + i * 110, 48, 0, c, "%s", lab[i]);
+            if (i < 2)
+                textf(fVcr, 980, 260 + i * 110, 48, 2, val[i] ? C2D_Color32(2, 244, 240, 255) : C2D_Color32(247, 1, 116, 255),
+                    "%s", val[i] ? "OUI" : "NON");
+            else
+                textf(fVcr, 980, 260 + i * 110, 48, 2, C2D_Color32(2, 244, 240, 255), ">");
+            if (i == sel) C2D_DrawRectSolid(FX(300), FY(260 + i * 110 + 56), 0.5f, FX(680), 2, C2D_Color32(247, 1, 116, 255));
         }
         fade_draw(dt);
-        bottom_info("Options", "A : changer   B : retour",
-            gSettings.ghostTapping ? "Ghost tapping : pas de penalite si tu appuies dans le vide" : "Appuyer dans le vide compte comme un rate");
+        bottom_info("Options", sel == 2 ? "A : configurer   B : retour" : "A : changer   B : retour",
+            sel == 2 ? "Choisis les boutons de chaque fleche"
+            : gSettings.ghostTapping ? "Ghost tapping : pas de penalite si tu appuies dans le vide"
+                                     : "Appuyer dans le vide compte comme un rate");
         C3D_FrameEnd(0);
         bg_update(osGetTime() / 1000.0f);
     }

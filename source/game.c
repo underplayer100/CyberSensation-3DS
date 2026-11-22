@@ -490,12 +490,8 @@ typedef struct {
 
 #define MAX_POPUPS 24
 
-static const u32 LANE_KEYS[4] = {
-    KEY_DLEFT | KEY_Y | KEY_CPAD_LEFT,
-    KEY_DDOWN | KEY_B | KEY_CPAD_DOWN,
-    KEY_DUP | KEY_X | KEY_CPAD_UP,
-    KEY_DRIGHT | KEY_A | KEY_CPAD_RIGHT,
-};
+/* boutons de chaque flèche : réglages du joueur (Options > Touches) */
+#define LANE_KEYS gSettings.laneKeys
 
 static bool stage_load(StageItem** items, int* count, float* zoom, float charPos[3][4], const char* name) {
     *items = NULL;
@@ -700,13 +696,12 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
         hidScanInput();
         u32 down = hidKeysDown(), held = hidKeysHeld();
         if (gAutoTest) {
-            const u32 DP = KEY_DLEFT | KEY_DDOWN | KEY_DUP | KEY_DRIGHT;
             down = held = 0;
             for (int i = nextNote[1]; i < chart.noteCount[1]; i++) {
                 Note* n = &chart.notes[1][i];
                 if (n->time > songPos + 5) break;
-                if (!n->hit && !n->missed && n->time >= songPos - 30) down |= LANE_KEYS[n->lane] & DP;
-                if (n->hit && n->holding) held |= LANE_KEYS[n->lane] & DP;
+                if (!n->hit && !n->missed && n->time >= songPos - 30) down |= LANE_KEYS[n->lane];
+                if (n->hit && n->holding) held |= LANE_KEYS[n->lane];
             }
             held |= down;
         }
@@ -1120,7 +1115,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
         if (prog > 1) prog = 1;
         C2D_DrawRectSolid(16, 160, 0.5f, 288, 8, C2D_Color32(60, 60, 90, 255));
         C2D_DrawRectSolid(16, 160, 0.5f, 288 * prog, 8, C2D_Color32(2, 244, 240, 255));
-        draw_text(16, 180, 0.42f, C2D_Color32(180, 180, 220, 255), "D-Pad / ABXY / Circle Pad : arrows");
+        draw_text(16, 180, 0.42f, C2D_Color32(180, 180, 220, 255), "Arrow buttons : Options > Touches");
         draw_text(16, 198, 0.42f, C2D_Color32(180, 180, 220, 255), "START : pause");
         if (paused) {
             C2D_DrawRectSolid(0, 0, 0.6f, 320, 240, C2D_Color32(0, 0, 0, 210));
