@@ -160,3 +160,36 @@ void stream_close(Stream* s) {
     if (s->f) fclose(s->f);
     memset(s, 0, sizeof(*s));
 }
+
+/* ---------------------------------------------------------------- bruitages (4 voix, lus depuis la SD) */
+#define SFX_SLOTS 4
+static Stream gSfx[SFX_SLOTS];
+static int gSfxNext;
+static bool gSfxEnabled = true;
+
+void sfx_enable(bool on) { gSfxEnabled = on; }
+
+void sfx_play(const char* path, float volume) {
+    if (!gSfxEnabled) return;
+    Stream* s = &gSfx[gSfxNext];
+    int ch = 4 + gSfxNext * 2;   /* canaux 4..11 : deux par voix (sons stéréo possibles) */
+    gSfxNext = (gSfxNext + 1) % SFX_SLOTS;
+    stream_close(s);
+    if (stream_open(s, path, ch)) {
+        stream_volume(s, volume);
+        stream_start(s);
+        stream_pause(s, false);
+    }
+}
+
+void sfx_update(void) {
+    for (int i = 0; i < SFX_SLOTS; i++) {
+        if (!gSfx[i].open) continue;
+        stream_update(&gSfx[i]);
+        if (stream_finished(&gSfx[i])) stream_close(&gSfx[i]);
+    }
+}
+
+void sfx_stop_all(void) {
+    for (int i = 0; i < SFX_SLOTS; i++) stream_close(&gSfx[i]);
+}

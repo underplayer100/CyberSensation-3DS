@@ -49,7 +49,7 @@ static u32 auto_down(void) {
 
 static Spr sTitle, sUi, sArt, sStory, sIcons;
 static C2D_Font fFree, fVcr;
-static Stream sMusic, sSfx;
+static Stream sMusic;
 static bool sAudio;
 static C3D_RenderTarget *sTop, *sBottom;
 static SongEntry* sSongs;
@@ -165,18 +165,30 @@ static void music_menu(void) {
 }
 static void sfx(const char* name) {
     if (!sAudio) return;
-    stream_close(&sSfx);
     char p[320];
     snprintf(p, sizeof(p), "%s/ui/sfx_%s.adp", gModDir, name);
-    if (stream_open(&sSfx, p, 4)) {
-        stream_start(&sSfx);
-        stream_pause(&sSfx, false);
-    }
+    sfx_play(p, 1.0f);
 }
 static void audio_tick(void) {
     stream_update(&sMusic);
-    stream_update(&sSfx);
-    if (sSfx.open && stream_finished(&sSfx)) stream_close(&sSfx);
+    sfx_update();
+}
+
+void hud_text(float x, float y, float size, int align, uint32_t color, bool outline, const char* fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (outline) {
+        uint32_t k = C2D_Color32(0, 0, 0, (u8)((color >> 24) & 0xFF));
+        float d = 1.2f / MS;
+        textf(fVcr, x - d, y, size, align, k, "%s", buf);
+        textf(fVcr, x + d, y, size, align, k, "%s", buf);
+        textf(fVcr, x, y - d, size, align, k, "%s", buf);
+        textf(fVcr, x, y + d, size, align, k, "%s", buf);
+    }
+    textf(fVcr, x, y, size, align, color, "%s", buf);
 }
 
 /* ---------------------------------------------------------------- scores */
@@ -397,7 +409,7 @@ static int find_song(const char* base, const char* diff) {
 
 static void play_list(const char** bases, int n, const char* storyId) {
     stream_close(&sMusic);
-    stream_close(&sSfx);
+    sfx_stop_all();
     int total = 0;
     for (int k = 0; k < n; k++) {
         int i = find_song(bases[k], "REGULAR");
@@ -767,7 +779,7 @@ static void freeplay_screen(void) {
         if (down & KEY_A) {
             SongEntry* s = &sSongs[it[cur].first + curDiff];
             stream_close(&sMusic);
-            stream_close(&sSfx);
+            sfx_stop_all();
             GameResult r;
             int sc = 0;
             float acc = 0;
@@ -1047,5 +1059,5 @@ void menu_run(C3D_RenderTarget* top, C3D_RenderTarget* bottom, bool audioOk) {
         if (r == -2) break;
     }
     stream_close(&sMusic);
-    stream_close(&sSfx);
+    sfx_stop_all();
 }

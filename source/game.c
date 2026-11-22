@@ -30,17 +30,20 @@ typedef struct {
 typedef struct {
     Spr spr;
     bool loaded;
-    float x, y, scx, scy;   /* position monde et défilement (parallaxe) */
-    bool flip, swapLR, isPlayerSide, gfDance;
+    float x, y, scx, scy;   /* position de dessin (scène + décalage global) et défilement */
+    float stageX, stageY;   /* position donnée par la scène (setPosition) */
+    float gx, gy;           /* décalage global du XML du personnage */
+    bool flip, swapLR, isPlayer;
     int anim;
     float animTime;
-    bool animDone;
     float holdTimer;        /* ms depuis la dernière note chantée */
     float holdTime;
     bool singing, danced;
+    int interval;
     float camx, camy;
     float baseW, baseH;     /* taille du premier cadre (monde) */
     int aIdle, aLeft, aRight, aSing[4], aMiss[4];
+    char noteSkin[32];
 } Character;
 
 typedef struct {
@@ -160,36 +163,41 @@ static float conductor_crochet(float ms) {
     return 60000.0f / gBpm[k].bpm;
 }
 
-/* ---------------------------------------------------------------- personnages */
+/* ---------------------------------------------------------------- personnages (règles de Codename Engine) */
 static const char* SING[4] = {"singLEFT", "singDOWN", "singUP", "singRIGHT"};
 
 static void char_play(Character* ch, int anim) {
     if (anim < 0) return;
     ch->anim = anim;
     ch->animTime = 0;
-    ch->animDone = false;
 }
 
-static bool char_load(Character* ch, const char* name, bool playerSide) {
+/* isPlayer = valeur "flip" de la scène (vrai pour boyfriend), comme dans PlayState.create */
+static bool char_load(Character* ch, const char* name, bool isPlayer) {
     memset(ch, 0, sizeof(*ch));
+    snprintf(ch->noteSkin, sizeof(ch->noteSkin), "default");
     if (!name[0]) return false;
     char path[384], tex[320];
     snprintf(path, sizeof(path), "%s/chars/%s.spr", gModDir, name);
     snprintf(tex, sizeof(tex), "%s/tex", gModDir);
     if (!spr_load(&ch->spr, path, tex)) return false;
     ch->loaded = true;
-    ch->isPlayerSide = playerSide;
-    bool isPlayer = spr_metaf(&ch->spr, "isPlayer", 0) != 0;
+    ch->isPlayer = isPlayer;
+    bool playerOffsets = spr_metaf(&ch->spr, "isPlayer", 0) != 0;
     bool flipX = spr_metaf(&ch->spr, "flipX", 0) != 0;
-    ch->flip = flipX != playerSide;
-    ch->swapLR = isPlayer != playerSide;
+    ch->flip = flipX != isPlayer;            /* fixChar : if (isPlayer) flipX = !flipX */
+    ch->swapLR = isPlayer != playerOffsets;  /* gauche/droite échangés, décalages en miroir */
     ch->holdTime = spr_metaf(&ch->spr, "holdTime", 4);
     ch->camx = spr_metaf(&ch->spr, "camx", 0);
     ch->camy = spr_metaf(&ch->spr, "camy", 0);
-    ch->gfDance = spr_metaf(&ch->spr, "gfDance", 0) != 0;
+    ch->gx = spr_metaf(&ch->spr, "x", 0);
+    ch->gy = spr_metaf(&ch->spr, "y", 0);
+    snprintf(ch->noteSkin, sizeof(ch->noteSkin), "%s", spr_metas(&ch->spr, "notesprite", "default"));
     ch->aIdle = spr_anim(&ch->spr, "idle");
     ch->aLeft = spr_anim(&ch->spr, "danceLeft");
     ch->aRight = spr_anim(&ch->spr, "danceRight");
+    int iv = (int)spr_metaf(&ch->spr, "interval", 0);
+    ch->interval = iv > 0 ? iv : (ch->aLeft >= 0 && ch->aRight >= 0) ? 1 : 2;
     for (int i = 0; i < 4; i++) {
         int src = ch->swapLR ? (i == 0 ? 3 : i == 3 ? 0 : i) : i;
         char m[40];
@@ -198,25 +206,45 @@ static bool char_load(Character* ch, const char* name, bool playerSide) {
         ch->aMiss[i] = spr_anim(&ch->spr, m);
         if (ch->aSing[i] < 0) ch->aSing[i] = ch->aIdle;
     }
-    int first = ch->aIdle >= 0 ? ch->aIdle : (ch->aLeft >= 0 ? ch->aLeft : 0);
+    int first = ch->aIdle >= 0 ? ch->aIdle : (ch->aRight >= 0 ? ch->aRight : 0);
     if (ch->spr.animCount > 0 && ch->spr.anims[first].count > 0) {
         SprFrame* fr = &ch->spr.frames[ch->spr.anims[first].frames[0]];
-        float sc = WORLD_S * spr_metaf(&ch->spr, "scale", 1);
         ch->baseW = fr->fw / WORLD_S;
         ch->baseH = fr->fh / WORLD_S;
-        (void)sc;
     }
     char_play(ch, first);
     return true;
 }
 
-static void char_dance(Character* ch, int beat) {
-    if (!ch->loaded || ch->singing) return;
-    if (ch->gfDance || (ch->aLeft >= 0 && ch->aRight >= 0)) {
-        char_play(ch, (beat % 2) ? ch->aLeft : ch->aRight);
-    } else if (beat % 2 == 0) {
+static void char_place(Character* ch, float sx, float sy, float scx, float scy) {
+    ch->stageX = sx;
+    ch->stageY = sy;
+    /* playAnim : offset = (isPlayer != playerOffsets ? gx : -gx, -gy) ; Flixel dessine à x - offset */
+    ch->x = sx + (ch->swapLR ? -ch->gx : ch->gx);
+    ch->y = sy + ch->gy;
+    ch->scx = scx;
+    ch->scy = scy;
+}
+
+static void char_dance_now(Character* ch) {
+    if (ch->aLeft >= 0 && ch->aRight >= 0) {
+        ch->danced = !ch->danced;
+        char_play(ch, ch->danced ? ch->aLeft : ch->aRight);
+    } else {
         char_play(ch, ch->aIdle);
     }
+    ch->singing = false;
+}
+
+/* beatHit -> tryDance */
+static void char_beat(Character* ch, int beat, float stepCrochet, bool locked) {
+    if (!ch->loaded || locked) return;
+    if (beat % ch->interval != 0) return;
+    if (ch->singing) {
+        if (ch->holdTimer >= stepCrochet * ch->holdTime) char_dance_now(ch);
+        return;
+    }
+    char_dance_now(ch);
 }
 
 static void char_sing(Character* ch, int lane, bool miss) {
@@ -228,22 +256,10 @@ static void char_sing(Character* ch, int lane, bool miss) {
     ch->holdTimer = 0;
 }
 
-static void char_update(Character* ch, float dt, float stepCrochet, bool keysHeld) {
+static void char_update(Character* ch, float dt) {
     if (!ch->loaded) return;
-    SprAnim* a = &ch->spr.anims[ch->anim];
     ch->animTime += dt;
-    float len = a->fps > 0 ? a->count * 1000.0f / a->fps : 0;
-    if (!a->loop && ch->animTime >= len) ch->animDone = true;
-    if (ch->singing) {
-        ch->holdTimer += dt;
-        if (ch->holdTimer >= stepCrochet * ch->holdTime && !(ch->isPlayerSide && keysHeld)) {
-            ch->singing = false;
-            int idle = ch->aIdle >= 0 ? ch->aIdle : ch->aRight;
-            char_play(ch, idle);
-            ch->animTime = len > 0 ? 100000.0f : 0;   /* reste sur la dernière image jusqu'au prochain temps */
-            ch->animTime = 0;
-        }
-    }
+    if (ch->singing) ch->holdTimer += dt;
 }
 
 /* ---------------------------------------------------------------- caméra / dessin monde */
@@ -259,16 +275,14 @@ static void world_to_screen(const Camera* cam, float wx, float wy, float scx, fl
 }
 
 static void draw_frame(const SprFrame* fr, float sx, float sy, float scale, bool flip, float alpha) {
+    if (alpha <= 0.003f) return;
     C2D_ImageTint tint;
-    C2D_AlphaImageTint(&tint, alpha);
+    C2D_AlphaImageTint(&tint, alpha > 1 ? 1 : alpha);
     float w = fr->sub.width * scale, h = fr->sub.height * scale;
     float ox = flip ? (fr->fw - fr->ox - fr->sub.width) : fr->ox;
-    C2D_DrawParams p = {
-        .pos = {sx + ox * scale + (flip ? w : 0), sy + fr->oy * scale, flip ? -w : w, h},
-        .center = {0, 0}, .depth = 0.5f, .angle = 0};
-    if (sx + ox * scale > SCREEN_W + 8 || sx + ox * scale + w < -8 || sy + fr->oy * scale > SCREEN_H + 8 ||
-        sy + fr->oy * scale + h < -8)
-        return;
+    float x0 = sx + ox * scale, y0 = sy + fr->oy * scale;
+    if (x0 > SCREEN_W + 8 || x0 + w < -8 || y0 > SCREEN_H + 8 || y0 + h < -8) return;
+    C2D_DrawParams p = {.pos = {x0 + (flip ? w : 0), y0, flip ? -w : w, h}, .center = {0, 0}, .depth = 0.5f};
     C2D_DrawImage(fr->img, &p, alpha < 1.0f ? &tint : NULL);
 }
 
@@ -293,69 +307,90 @@ static void char_draw(const Character* ch, const Camera* cam) {
     draw_frame(fr, sx, sy, cam->zoom, ch->flip, 1.0f);
 }
 
+/* getCameraPosition : milieu du personnage (position de scène) + (joueur ? -100 : 150) + décalages */
 static void char_camera(const Character* ch, float* x, float* y) {
-    float mx = ch->x + ch->baseW / 2, my = ch->y + ch->baseH / 2;
-    float cx = ch->swapLR ? -ch->camx : ch->camx;
-    *x = mx + (ch->isPlayerSide ? -100.0f : 150.0f) + cx;
-    *y = my - 100.0f + ch->camy;
+    *x = ch->stageX + ch->baseW / 2 + (ch->isPlayer ? -100.0f : 150.0f) + ch->gx + ch->camx;
+    *y = ch->stageY + ch->baseH / 2 - 100.0f + ch->gy + ch->camy;
 }
 
-/* ---------------------------------------------------------------- HUD */
-static Spr gNotes, gMisc, gIcons;
-static bool gUiLoaded;
+/* ---------------------------------------------------------------- HUD (coordonnées FNF 1280x720) */
+static Spr gNotesDef, gNotesSkin[2], gMisc, gIcons, gSplash;
+static bool gUiLoaded, gSkinLoaded[2];
 
 static void ui_load(void) {
     if (gUiLoaded) return;
     char p[320], t[320];
     snprintf(t, sizeof(t), "%s/tex", gModDir);
     snprintf(p, sizeof(p), "%s/ui/notes.spr", gModDir);
-    spr_load(&gNotes, p, t);
+    spr_load(&gNotesDef, p, t);
     snprintf(p, sizeof(p), "%s/ui/misc.spr", gModDir);
     spr_load(&gMisc, p, t);
     snprintf(p, sizeof(p), "%s/ui/icons.spr", gModDir);
     spr_load(&gIcons, p, t);
+    snprintf(p, sizeof(p), "%s/ui/splash.spr", gModDir);
+    spr_load(&gSplash, p, t);
     gUiLoaded = true;
 }
 
-#define HUD_S WORLD_S
-#define HUD_Y0 ((SCREEN_H - 720.0f * HUD_S) / 2.0f)
+static const Spr* skin_for(int side) { return gSkinLoaded[side] ? &gNotesSkin[side] : &gNotesDef; }
+
+#define HUD_Y0 ((SCREEN_H - 720.0f * WORLD_S) / 2.0f)
 #define LANE_W (160.0f * 0.7f)
 
-static float lane_x(int side, int lane) {
-    float base = 1280.0f * (side ? 0.75f : 0.25f) - LANE_W * 2.0f;
-    return (base + lane * LANE_W + LANE_W / 2.0f) * HUD_S;
-}
-static const float STRUM_Y = 50.0f;
+typedef struct {
+    float zoom;
+    bool down;
+} Hud;
 
-static void draw_centered(const Spr* s, int anim, int frameIdx, float cx, float cy, float scale, float alpha) {
+/* FNF -> écran, avec zoom du HUD autour du centre et miroir vertical en downscroll */
+static float hx(const Hud* h, float x) { return ((x * WORLD_S) - SCREEN_W / 2.0f) * h->zoom + SCREEN_W / 2.0f; }
+static float hy(const Hud* h, float y) {
+    if (h->down) y = 720.0f - y;
+    return ((HUD_Y0 + y * WORLD_S) - SCREEN_H / 2.0f) * h->zoom + SCREEN_H / 2.0f;
+}
+
+/* calculateStartingXPos + swagWidth * i, puis centre de la flèche */
+static float lane_cx(int side, int lane) {
+    float start = 1280.0f * (side ? 0.75f : 0.25f) - (LANE_W * 1.5f + LANE_W * 0.5f);
+    return start + LANE_W * lane + LANE_W / 2.0f;
+}
+#define STRUM_CY (50.0f + LANE_W / 2.0f)
+
+static void draw_centered(const Hud* h, const Spr* s, int anim, int frameIdx, float cx, float cy, float scale, float alpha,
+    bool flip) {
     if (anim < 0 || anim >= s->animCount || s->anims[anim].count == 0) return;
     const SprAnim* a = &s->anims[anim];
     const SprFrame* fr = &s->frames[a->frames[frameIdx % a->count]];
-    float w = fr->fw * scale, h = fr->fh * scale;
-    draw_frame(fr, cx - w / 2, cy - h / 2, scale, false, alpha);
+    float sc = scale * h->zoom;
+    float w = fr->fw * sc, hh = fr->fh * sc;
+    draw_frame(fr, hx(h, cx) - w / 2, hy(h, cy) - hh / 2, sc, flip, alpha);
 }
 
-static void draw_hold(int lane, float cx, float y0, float y1, float alpha) {
-    /* morceau répété étiré entre y0 et y1, puis bout de la tenue */
-    if (y1 <= y0) return;
+/* tenue : corps étiré du début à la fin, bout de la tenue au bout (retourné en downscroll) */
+static void draw_hold(const Hud* h, const Spr* sk, int lane, float cx, float yStart, float yEnd, float alpha) {
+    if (yEnd <= yStart) return;
     int piece = 16 + lane, end = 20 + lane;
-    if (piece >= gNotes.animCount || gNotes.anims[piece].count == 0) return;
-    const SprFrame* pf = &gNotes.frames[gNotes.anims[piece].frames[0]];
-    const SprFrame* ef = gNotes.anims[end].count ? &gNotes.frames[gNotes.anims[end].frames[0]] : NULL;
-    float endH = ef ? ef->sub.height : 0;
-    float bodyEnd = y1 - endH;
-    if (bodyEnd > y0) {
-        C2D_ImageTint tint;
-        C2D_AlphaImageTint(&tint, alpha);
-        C2D_DrawParams p = {.pos = {cx - pf->sub.width / 2.0f, y0, pf->sub.width, bodyEnd - y0}, .depth = 0.5f};
+    if (piece >= sk->animCount || sk->anims[piece].count == 0) return;
+    const SprFrame* pf = &sk->frames[sk->anims[piece].frames[0]];
+    const SprFrame* ef = end < sk->animCount && sk->anims[end].count ? &sk->frames[sk->anims[end].frames[0]] : NULL;
+    float z = h->zoom;
+    float endH = ef ? ef->sub.height / WORLD_S : 0;
+    float bodyEnd = yEnd - endH > yStart ? yEnd - endH : yStart;
+    float x = hx(h, cx);
+    C2D_ImageTint tint;
+    C2D_AlphaImageTint(&tint, alpha);
+    float a0 = hy(h, yStart), a1 = hy(h, bodyEnd);
+    if (bodyEnd > yStart) {
+        float top = a0 < a1 ? a0 : a1, ht = fabsf(a1 - a0);
+        C2D_DrawParams p = {.pos = {x - pf->sub.width * z / 2.0f, top, pf->sub.width * z, ht}, .depth = 0.5f};
         C2D_DrawImage(pf->img, &p, &tint);
     }
     if (ef) {
-        float ey = bodyEnd > y0 ? bodyEnd : y0;
-        float eh = y1 - ey;
-        C2D_ImageTint tint;
-        C2D_AlphaImageTint(&tint, alpha);
-        C2D_DrawParams p = {.pos = {cx - ef->sub.width / 2.0f, ey, ef->sub.width, eh}, .depth = 0.5f};
+        float b0 = hy(h, bodyEnd), b1 = hy(h, yEnd);
+        float top = b0 < b1 ? b0 : b1, ht = fabsf(b1 - b0);
+        bool flipY = h->down;
+        C2D_DrawParams p = {.pos = {x - ef->sub.width * z / 2.0f, flipY ? top + ht : top, ef->sub.width * z, flipY ? -ht : ht},
+            .depth = 0.5f};
         C2D_DrawImage(ef->img, &p, &tint);
     }
 }
@@ -365,6 +400,20 @@ typedef struct {
     int anim;          /* 0 statique, 1 appui, 2 confirmation */
     float time;
 } Strum;
+
+typedef struct {
+    bool on;
+    int lane, side, anim;
+    float t;
+} Splash;
+
+typedef struct {
+    bool on;
+    int anim;          /* index dans gMisc */
+    float x, y, vx, vy, ay, t, fadeStart, fadeDur;
+} Popup;
+
+#define MAX_POPUPS 24
 
 static const u32 LANE_KEYS[4] = {
     KEY_DLEFT | KEY_Y | KEY_CPAD_LEFT,
@@ -376,7 +425,7 @@ static const u32 LANE_KEYS[4] = {
 static bool stage_load(StageItem** items, int* count, float* zoom, float charPos[3][4], const char* name) {
     *items = NULL;
     *count = 0;
-    *zoom = 1.0f;
+    *zoom = 1.05f;
     float defs[3][4] = {{770, 100, 1, 1}, {100, 100, 1, 1}, {400, 130, 0.95f, 0.95f}};
     memcpy(charPos, defs, sizeof(defs));
     char path[384], tex[320];
@@ -425,7 +474,6 @@ static bool stage_load(StageItem** items, int* count, float* zoom, float charPos
         }
         fclose(f);
     }
-    /* personnages absents du décor : gf derrière, puis dad, puis bf */
     int order[3] = {2, 1, 0};
     for (int k = 0; k < 3; k++)
         if (!haveChar[order[k]]) {
@@ -438,8 +486,41 @@ static bool stage_load(StageItem** items, int* count, float* zoom, float charPos
     return true;
 }
 
-static int text_score(char* buf, size_t n, int score, int misses, float acc) {
-    return snprintf(buf, n, "Score: %d | Rates: %d | Precision: %.2f%%", score, misses, acc);
+static const char* rank_of(float acc) {
+    if (acc < 0) return "N/A";
+    if (acc >= 1.0f) return "S++";
+    if (acc >= 0.95f) return "S";
+    if (acc >= 0.9f) return "A";
+    if (acc >= 0.85f) return "B";
+    if (acc >= 0.8f) return "C";
+    if (acc >= 0.7f) return "D";
+    if (acc >= 0.5f) return "E";
+    return "F";
+}
+
+static void play_ui_sfx(const char* name, float vol) {
+    char p[320];
+    snprintf(p, sizeof(p), "%s/ui/sfx_%s.adp", gModDir, name);
+    sfx_play(p, vol);
+}
+
+static float frand(float a, float b) { return a + (b - a) * (float)rand() / (float)RAND_MAX; }
+static float ease_circ_out(float t) { return sqrtf(1 - (t - 1) * (t - 1)); }
+static float ease_cube_in_out(float t) { return t < 0.5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2; }
+
+static void add_popup(Popup* pops, int anim, float x, float y, float vx, float vy, float ay, float fadeStart, float fadeDur) {
+    if (anim < 0) return;
+    for (int k = 0; k < MAX_POPUPS; k++)
+        if (!pops[k].on) {
+            pops[k] = (Popup){true, anim, x, y, vx, vy, ay, 0, fadeStart, fadeDur};
+            return;
+        }
+}
+
+static void miss_sound(void) {
+    char mn[16];
+    snprintf(mn, sizeof(mn), "missnote%d", 1 + rand() % 3);
+    play_ui_sfx(mn, frand(0.1f, 0.2f));
 }
 
 GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTarget* bottom,
@@ -447,12 +528,11 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     char path[384];
     Chart chart;
     snprintf(path, sizeof(path), "%s/songs/%s/chart.sng", gModDir, song->id);
-    /* écran de chargement */
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C2D_TargetClear(top, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(top);
     C2D_TextBufClear(gTextBuf);
-    draw_text_centered(200, 110, 0.7f, C2D_Color32(255, 255, 255, 255), "Chargement...");
+    draw_text_centered(200, 110, 0.7f, C2D_Color32(255, 255, 255, 255), "Loading...");
     C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
     C3D_FrameEnd(0);
 
@@ -469,17 +549,20 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     char_load(&chars[0], chart.chars[1], true);
     char_load(&chars[1], chart.chars[0], false);
     char_load(&chars[2], chart.chars[2], false);
-    for (int i = 0; i < 3; i++) {
-        float cx = 0, cy = 0;
-        if (chars[i].loaded) {
-            cx = spr_metaf(&chars[i].spr, "x", 0);
-            cy = spr_metaf(&chars[i].spr, "y", 0);
+    for (int i = 0; i < 3; i++) char_place(&chars[i], charPos[i][0], charPos[i][1], charPos[i][2], charPos[i][3]);
+
+    /* flèches propres au personnage de chaque côté (notesprite) */
+    char tex[320];
+    snprintf(tex, sizeof(tex), "%s/tex", gModDir);
+    for (int side = 0; side < 2; side++) {
+        Character* c = side ? &chars[0] : &chars[1];
+        gSkinLoaded[side] = false;
+        if (c->loaded && strcmp(c->noteSkin, "default") != 0) {
+            snprintf(path, sizeof(path), "%s/ui/notes_%s.spr", gModDir, c->noteSkin);
+            gSkinLoaded[side] = spr_load(&gNotesSkin[side], path, tex);
         }
-        chars[i].x = charPos[i][0] + cx;
-        chars[i].y = charPos[i][1] + cy;
-        chars[i].scx = charPos[i][2];
-        chars[i].scy = charPos[i][3];
     }
+
     const char* iconP = chars[0].loaded ? spr_metas(&chars[0].spr, "icon", "bf") : "bf";
     const char* iconD = chars[1].loaded ? spr_metas(&chars[1].spr, "icon", "dad") : "dad";
     int aIconP = spr_anim(&gIcons, iconP), aIconD = spr_anim(&gIcons, iconD);
@@ -495,47 +578,54 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     char_camera(chars[1].loaded ? &chars[1] : &chars[0], &camTX, &camTY);
     cam.x = camTX;
     cam.y = camTY;
-    float camZoomBump = 0, hudZoomBump = 0;
+    float hudZoom = 1.0f;
 
     Strum strums[2][4];
     memset(strums, 0, sizeof(strums));
+    Splash splashes[8];
+    memset(splashes, 0, sizeof(splashes));
+    Popup pops[MAX_POPUPS];
+    memset(pops, 0, sizeof(pops));
     float health = 1.0f;
-    int score = 0, misses = 0, combo = 0, hits = 0;
+    int score = 0, misses = 0, combo = 0, pressedNotes = 0;
     float accSum = 0;
     int nextNote[2] = {0, 0};
     int nextEvent = 0;
-    float ratingTime = -1;
-    int ratingAnim = -1;
-    int lastBeat = -1;
+    int lastBeat = -1000, lastTick = -1;
+    float iconScale = 1.0f;
     bool started = false, paused = false, dead = false;
     int pauseSel = 0;
     GameResult result = GAME_DONE;
     float crochet0 = conductor_crochet(0);
     double songPos = -crochet0 * 5.0;
-    u64 lastTick = svcGetSystemTick();
+    float introTime = 0;
+    u64 lastTk = svcGetSystemTick();
     double lastAudio = -1, audioBase = 0;
     u64 audioTick = 0;
-    bool altAnim = false;
-    (void)altAnim;
+    srand((unsigned)osGetTime());
+    Hud hud = {1.0f, gSettings.downscroll};
+    static const char* RN[5] = {"", "sick", "good", "bad", "shit"};
+    static const char* SC[4] = {"purple", "blue", "green", "red"};
 
     while (aptMainLoop()) {
         u64 now = svcGetSystemTick();
-        float dt = (float)((now - lastTick) * 1000.0 / SYSCLOCK_ARM11);
-        lastTick = now;
+        float dt = (float)((now - lastTk) * 1000.0 / SYSCLOCK_ARM11);
+        lastTk = now;
         if (dt > 100) dt = 100;
         hidScanInput();
         u32 down = hidKeysDown(), held = hidKeysHeld();
         if (gAutoTest) {
-            /* robot : appuie sur chaque note du joueur au bon moment et tient les tenues */
+            const u32 DP = KEY_DLEFT | KEY_DDOWN | KEY_DUP | KEY_DRIGHT;
             down = held = 0;
             for (int i = nextNote[1]; i < chart.noteCount[1]; i++) {
                 Note* n = &chart.notes[1][i];
                 if (n->time > songPos + 5) break;
-                if (!n->hit && !n->missed && n->time >= songPos - 30) down |= LANE_KEYS[n->lane] & (KEY_DLEFT | KEY_DDOWN | KEY_DUP | KEY_DRIGHT);
-                if (n->hit && n->holding) held |= LANE_KEYS[n->lane] & (KEY_DLEFT | KEY_DDOWN | KEY_DUP | KEY_DRIGHT);
+                if (!n->hit && !n->missed && n->time >= songPos - 30) down |= LANE_KEYS[n->lane] & DP;
+                if (n->hit && n->holding) held |= LANE_KEYS[n->lane] & DP;
             }
             held |= down;
         }
+        sfx_update();
 
         if (paused) {
             if (down & (KEY_DUP | KEY_DDOWN)) pauseSel = (pauseSel + ((down & KEY_DDOWN) ? 1 : 2)) % 3;
@@ -555,13 +645,12 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                 stream_pause(&voices, false);
             }
             dt = 0;
-        } else if (down & KEY_START && !dead) {
+        } else if ((down & KEY_START) && !dead) {
             paused = true;
             pauseSel = 0;
             stream_pause(&inst, true);
             stream_pause(&voices, true);
         }
-
         if (dead) {
             if (down & KEY_A) {
                 result = GAME_RESTART;
@@ -575,6 +664,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
 
         /* ---- temps de la chanson */
         if (!paused && !dead) {
+            introTime += dt;
             if (!started) {
                 songPos += dt;
                 if (songPos >= 0) {
@@ -600,7 +690,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                 if (interp > songPos) songPos = interp;
                 if (!haveInst) songPos += dt;
                 if ((haveInst && stream_finished(&inst)) ||
-                    (!haveInst && songPos > chart.notes[1][chart.noteCount[1] - 1].time + 2000)) {
+                    (!haveInst && chart.noteCount[1] > 0 && songPos > chart.notes[1][chart.noteCount[1] - 1].time + 2000)) {
                     result = GAME_DONE;
                     break;
                 }
@@ -610,6 +700,14 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
         float crochet = conductor_crochet(pos > 0 ? pos : 0);
         float stepCrochet = crochet / 4.0f;
 
+        /* ---- compte à rebours : 3, 2 (ready), 1 (set), go */
+        int tick = (int)floorf((float)(songPos + crochet0 * 5.0) / crochet0) - 1;
+        if (!started && !paused && tick != lastTick && tick >= 0 && tick <= 3) {
+            static const char* SND[4] = {"intro3", "intro2", "intro1", "introGo"};
+            play_ui_sfx(SND[tick], 1.0f);
+            lastTick = tick;
+        }
+
         /* ---- événements */
         while (nextEvent < chart.eventCount && chart.events[nextEvent].time <= pos) {
             Event* e = &chart.events[nextEvent++];
@@ -617,24 +715,28 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                 int t = (int)e->value;
                 Character* c = t == 1 ? &chars[0] : t == 2 ? &chars[2] : &chars[1];
                 if (c->loaded) char_camera(c, &camTX, &camTY);
-            } else if (e->kind == 2) {
-                altAnim = e->value != 0;
             }
         }
+
+        bool anyHeld = false;
+        for (int l = 0; l < 4; l++)
+            if (held & LANE_KEYS[l]) anyHeld = true;
 
         /* ---- temps forts */
         int beat = (int)floorf(conductor_beat(pos));
         if (beat != lastBeat && !paused) {
             lastBeat = beat;
-            for (int i = 0; i < 3; i++) char_dance(&chars[i], beat < 0 ? -beat : beat);
+            int b = beat < 0 ? -beat : beat;
+            for (int i = 0; i < 3; i++) char_beat(&chars[i], b, stepCrochet, i == 0 && anyHeld);
             if (started && beat % 4 == 0) {
-                camZoomBump += 0.015f;
-                hudZoomBump += 0.03f;
+                cam.zoom += 0.015f;
+                hudZoom += 0.03f;
             }
+            iconScale = 1.2f;
         }
 
         if (!paused && !dead) {
-            /* ---- adversaire : notes jouées automatiquement */
+            /* ---- adversaire */
             for (int i = nextNote[0]; i < chart.noteCount[0]; i++) {
                 Note* n = &chart.notes[0][i];
                 if (n->time > pos) break;
@@ -646,23 +748,18 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                     if (haveVoices) stream_volume(&voices, 1.0f);
                 }
                 if (n->time + n->sLen < pos) nextNote[0] = i + 1;
-                else {
-                    /* tenue : l'adversaire continue de chanter */
-                    if (n->sLen > 0 && pos < n->time + n->sLen) {
-                        chars[1].holdTimer = 0;
-                        strums[0][n->lane].anim = 2;
-                    }
+                else if (n->sLen > 0) {
+                    chars[1].holdTimer = 0;
+                    strums[0][n->lane].anim = 2;
                 }
             }
             for (int l = 0; l < 4; l++)
-                if (strums[0][l].anim == 2 && strums[0][l].time > 150) strums[0][l].anim = 0;
+                if (strums[0][l].anim == 2 && strums[0][l].time > crochet * 0.5f) strums[0][l].anim = 0;
 
             /* ---- joueur */
-            bool anyHeld = false;
             for (int l = 0; l < 4; l++) {
                 bool pressed = (down & LANE_KEYS[l]) != 0;
                 bool isHeld = (held & LANE_KEYS[l]) != 0;
-                if (isHeld) anyHeld = true;
                 if (pressed) {
                     Note* best = NULL;
                     for (int i = nextNote[1]; i < chart.noteCount[1]; i++) {
@@ -679,46 +776,65 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                         best->hit = true;
                         best->holding = best->sLen > 0;
                         int r, pts;
-                        float a;
-                        if (diff <= 45) r = 1, pts = 350, a = 1.0f;
-                        else if (diff <= 90) r = 2, pts = 200, a = 0.75f;
-                        else if (diff <= 135) r = 3, pts = 100, a = 0.45f;
-                        else r = 4, pts = 50, a = 0.1f;
+                        float a, hg;
+                        if (diff <= 45) r = 1, pts = 300, a = 1.0f, hg = 0.023f;
+                        else if (diff <= 90) r = 2, pts = 200, a = 0.75f, hg = 0.015f;
+                        else if (diff <= 135) r = 3, pts = 100, a = 0.45f, hg = 0.0f;
+                        else r = 4, pts = 50, a = 0.25f, hg = -0.05f;
                         score += pts;
                         combo++;
-                        hits++;
+                        pressedNotes++;
                         accSum += a;
-                        health += 0.023f;
-                        ratingAnim = r;
-                        ratingTime = 0;
+                        health += hg;
                         char_sing(&chars[0], l, false);
                         strums[1][l].anim = 2;
                         strums[1][l].time = 0;
                         if (haveVoices) stream_volume(&voices, 1.0f);
+                        /* jugement qui saute puis retombe ; chiffres du combo à partir de 10 */
+                        add_popup(pops, spr_anim(&gMisc, RN[r]), 664 + frand(0, 10), 300 + frand(-10, 10), frand(-10, 10),
+                            -frand(140, 175), 550, 200, crochet);
+                        if (combo >= 10) {
+                            char digits[12];
+                            snprintf(digits, sizeof(digits), "%03d", combo);
+                            for (int d = 0; digits[d]; d++) {
+                                char nm[8];
+                                snprintf(nm, sizeof(nm), "num%c", digits[d]);
+                                add_popup(pops, spr_anim(&gMisc, nm), 614 + 43 * d, 440, frand(-5, 5), -frand(140, 160),
+                                    frand(200, 300), 0, crochet * 2);
+                            }
+                        }
+                        if (r == 1)
+                            for (int k = 0; k < 8; k++)
+                                if (!splashes[k].on) {
+                                    char nm[16];
+                                    snprintf(nm, sizeof(nm), "%d%s", 1 + rand() % 2, SC[l]);
+                                    splashes[k] = (Splash){true, l, 1, spr_anim(&gSplash, nm), 0};
+                                    break;
+                                }
                     } else {
                         strums[1][l].anim = 1;
                         strums[1][l].time = 0;
+                        if (!gSettings.ghostTapping) {
+                            health -= 0.04f;
+                            misses++;
+                            combo = 0;
+                            score -= 10;
+                            char_sing(&chars[0], l, true);
+                            miss_sound();
+                        }
                     }
                 }
-                if (!isHeld && strums[1][l].anim != 0 && strums[1][l].time > 60) strums[1][l].anim = 0;
+                if (!isHeld && strums[1][l].anim != 0) strums[1][l].anim = 0;
             }
             /* tenues et notes ratées */
             for (int i = nextNote[1]; i < chart.noteCount[1]; i++) {
                 Note* n = &chart.notes[1][i];
                 if (n->time > pos + HIT_WINDOW) break;
                 if (n->hit && n->holding) {
-                    if (held & LANE_KEYS[n->lane]) {
-                        if (pos < n->time + n->sLen) {
-                            chars[0].holdTimer = 0;
-                            strums[1][n->lane].anim = 2;
-                            health += 0.0002f * dt;
-                        } else {
-                            n->holding = false;
-                            n->holdDone = true;
-                        }
-                    } else if (pos < n->time + n->sLen - stepCrochet) {
-                        n->holding = false;   /* lâchée trop tôt */
-                        n->holdDone = true;
+                    if ((held & LANE_KEYS[n->lane]) && pos < n->time + n->sLen) {
+                        chars[0].holdTimer = 0;
+                        strums[1][n->lane].anim = 2;
+                        health += 0.00023f * dt;
                     } else {
                         n->holding = false;
                         n->holdDone = true;
@@ -728,17 +844,17 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                     n->missed = true;
                     misses++;
                     combo = 0;
-                    hits++;
+                    pressedNotes++;
                     health -= 0.0475f;
                     score -= 10;
                     char_sing(&chars[0], n->lane, true);
                     if (haveVoices) stream_volume(&voices, 0.0f);
+                    miss_sound();
                 }
             }
             while (nextNote[1] < chart.noteCount[1]) {
                 Note* n = &chart.notes[1][nextNote[1]];
-                bool over = (n->missed || n->hit) && !n->holding && pos > n->time + n->sLen + 200;
-                if (!over) break;
+                if (!((n->missed || n->hit) && !n->holding && pos > n->time + n->sLen + 200)) break;
                 nextNote[1]++;
             }
             if (health > 2) health = 2;
@@ -750,22 +866,33 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
             }
             for (int s = 0; s < 2; s++)
                 for (int l = 0; l < 4; l++) strums[s][l].time += dt;
-
-            for (int i = 0; i < 3; i++) char_update(&chars[i], dt, stepCrochet, i == 0 && anyHeld);
+            for (int i = 0; i < 3; i++) char_update(&chars[i], dt);
             for (int i = 0; i < stageCount; i++) stage[i].animTime += dt;
-            if (ratingTime >= 0) ratingTime += dt;
+            for (int k = 0; k < 8; k++)
+                if (splashes[k].on && (splashes[k].t += dt) > 400) splashes[k].on = false;
+            for (int k = 0; k < MAX_POPUPS; k++) {
+                Popup* p = &pops[k];
+                if (!p->on) continue;
+                float s = dt / 1000.0f;
+                p->vy += p->ay * s;
+                p->x += p->vx * s;
+                p->y += p->vy * s;
+                p->t += dt;
+                if (p->t > p->fadeStart + p->fadeDur) p->on = false;
+            }
         }
 
-        /* ---- caméra */
-        float lerp = 1.0f - powf(0.96f, dt / 16.67f);
-        cam.x += (camTX - cam.x) * lerp;
-        cam.y += (camTY - cam.y) * lerp;
+        /* ---- caméra : suivi 0,04 et retour du zoom 0,05 par image à 60 i/s */
+        float follow = 1.0f - powf(1.0f - 0.04f, dt / 16.67f);
+        cam.x += (camTX - cam.x) * follow;
+        cam.y += (camTY - cam.y) * follow;
         float back = 1.0f - powf(0.95f, dt / 16.67f);
-        camZoomBump -= camZoomBump * back;
-        hudZoomBump -= hudZoomBump * back;
-        cam.zoom = stageZoom + camZoomBump;
+        cam.zoom += (stageZoom - cam.zoom) * back;
+        hudZoom += (1.0f - hudZoom) * back;
+        iconScale += (1.0f - iconScale) * (1.0f - powf(0.85f, dt / 16.67f));
+        hud.zoom = hudZoom;
 
-        /* ---- dessin écran du haut */
+        /* ---- écran du haut */
         C2D_TextBufClear(gTextBuf);
         C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
         C2D_TargetClear(top, C2D_Color32(0, 0, 0, 255));
@@ -784,105 +911,123 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
             draw_frame(fr, sx, sy, cam.zoom * s->scale, s->flip, s->alpha);
         }
 
-        /* HUD : flèches */
-        float hz = 1.0f + hudZoomBump;
-#define HX(x) (((x) - SCREEN_W / 2.0f) * hz + SCREEN_W / 2.0f)
-#define HY(y) (((y) - SCREEN_H / 2.0f) * hz + SCREEN_H / 2.0f)
-        float strumY = HUD_Y0 + (STRUM_Y + LANE_W / 2.0f) * HUD_S;
-        float pxPerMs = 0.45f * chart.speed * HUD_S;
+        Hud flat = {hud.zoom, false};
+        for (int k = 0; k < MAX_POPUPS; k++) {
+            Popup* p = &pops[k];
+            if (!p->on) continue;
+            float al = p->t < p->fadeStart ? 1 : 1 - (p->t - p->fadeStart) / p->fadeDur;
+            const SprFrame* fr = &gMisc.frames[gMisc.anims[p->anim].frames[0]];
+            draw_frame(fr, hx(&flat, p->x), hy(&flat, p->y), hud.zoom, false, al);
+        }
+
+        /* flèches : apparition y-10 et alpha 0 -> 1 en 1 s (circOut), décalées de 0,5 + 0,2 i s */
+        float pxPerMs = 0.45f * chart.speed;
         for (int s = 0; s < 2; s++) {
+            const Spr* sk = skin_for(s);
             for (int l = 0; l < 4; l++) {
+                float t0 = introTime / 1000.0f - (0.5f + 0.2f * l);
+                float k = t0 <= 0 ? 0 : t0 >= 1 ? 1 : ease_circ_out(t0);
                 int anim = strums[s][l].anim == 2 ? 8 + l : strums[s][l].anim == 1 ? 4 + l : l;
+                if (anim >= sk->animCount || sk->anims[anim].count == 0) anim = l;
                 int fi = (int)(strums[s][l].time * 24 / 1000.0f);
-                if (anim >= gNotes.animCount || gNotes.anims[anim].count == 0) anim = l;
-                if (fi >= gNotes.anims[anim].count) fi = gNotes.anims[anim].count - 1;
-                draw_centered(&gNotes, anim, fi, HX(lane_x(s, l)), HY(strumY), hz, 1.0f);
+                if (anim < sk->animCount && sk->anims[anim].count && fi >= sk->anims[anim].count) fi = sk->anims[anim].count - 1;
+                draw_centered(&hud, sk, anim, fi, lane_cx(s, l), STRUM_CY - 10 + 10 * k, 1.0f, k, false);
             }
             Note* ns = chart.notes[s];
             int from = nextNote[s] > 8 ? nextNote[s] - 8 : 0;
             for (int i = from; i < chart.noteCount[s]; i++) {
                 Note* n = &ns[i];
-                float y = strumY + (n->time - pos) * pxPerMs;
-                if (y > SCREEN_H + 40) break;
-                float cx = lane_x(s, n->lane);
+                float y = STRUM_CY + (n->time - pos) * pxPerMs;
+                if (y > 720 + 150) break;
+                float cx = lane_cx(s, n->lane);
                 if (n->sLen > 0 && !n->holdDone && !(n->missed && pos > n->time + n->sLen)) {
-                    float y0 = n->hit ? strumY : y;
-                    float y1 = strumY + (n->time + n->sLen - pos) * pxPerMs;
-                    if (y1 > y0) draw_hold(n->lane, HX(cx), HY(y0), HY(y1), n->missed ? 0.3f : 0.6f);
+                    float y0 = n->hit ? STRUM_CY : y;
+                    float y1 = STRUM_CY + (n->time + n->sLen - pos) * pxPerMs;
+                    if (y1 > y0) draw_hold(&hud, sk, n->lane, cx, y0, y1, n->missed ? 0.3f : 0.6f);
                 }
-                if (n->hit) continue;
-                if (y < -40) continue;
-                draw_centered(&gNotes, 12 + n->lane, 0, HX(cx), HY(y), hz, n->missed ? 0.3f : 1.0f);
+                if (n->hit || y < -150) continue;
+                draw_centered(&hud, sk, 12 + n->lane, 0, cx, y, 1.0f, n->missed ? 0.3f : 1.0f, false);
             }
         }
+        for (int k = 0; k < 8; k++) {
+            Splash* sp = &splashes[k];
+            if (!sp->on || sp->anim < 0) continue;
+            draw_centered(&hud, &gSplash, sp->anim, (int)(sp->t * 24 / 1000), lane_cx(sp->side, sp->lane), STRUM_CY, 1.0f,
+                0.6f, false);
+        }
 
-        /* barre de vie + icônes */
+        /* barre de vie (y = 0,9 x hauteur), icônes et textes */
         int aBar = spr_anim(&gMisc, "healthBar");
-        float barY = HUD_Y0 + 720.0f * 0.89f * HUD_S;
         if (aBar >= 0) {
-            const SprFrame* bf = &gMisc.frames[gMisc.anims[aBar].frames[0]];
-            float bw = bf->sub.width, bh = bf->sub.height;
-            float bx = (SCREEN_W - bw) / 2;
-            draw_frame(bf, HX(bx), HY(barY - bh / 2), hz, false, 1.0f);
-            float inner = bw - 2;
-            float split = bx + 1 + inner * (1.0f - health / 2.0f);
-            C2D_DrawRectSolid(HX(bx + 1), HY(barY - bh / 2 + 1), 0.5f, (split - bx - 1) * hz, (bh - 2) * hz,
-                C2D_Color32(255, 0, 0, 255));
-            C2D_DrawRectSolid(HX(split), HY(barY - bh / 2 + 1), 0.5f, (bx + 1 + inner - split) * hz, (bh - 2) * hz,
-                C2D_Color32(102, 255, 51, 255));
-            float iconScale = hz * (1.0f + hudZoomBump * 2);
-            if (aIconD >= 0) draw_centered(&gIcons, aIconD, health > 1.6f ? 1 : 0, HX(split - 14), HY(barY), iconScale, 1.0f);
+            const SprFrame* bfr = &gMisc.frames[gMisc.anims[aBar].frames[0]];
+            float bw = bfr->fw / WORLD_S, bh = bfr->fh / WORLD_S;
+            float bx = (1280 - bw) / 2, by = 720 * 0.9f;
+            float z = hud.zoom;
+            float barMid = by + bh / 2;
+            float tY = hy(&hud, barMid) - bh * WORLD_S * z / 2;
+            draw_frame(bfr, hx(&hud, bx), tY, z, false, 1.0f);
+            float ix = bx + 4, iw = bw - 8;
+            float center = ix + iw * (1.0f - health / 2.0f);
+            float y0 = tY + 4 * WORLD_S * z, hh = (bh - 8) * WORLD_S * z;
+            if (hh < 1) hh = 1;
+            C2D_DrawRectSolid(hx(&hud, ix), y0, 0.5f, (center - ix) * WORLD_S * z, hh, C2D_Color32(255, 0, 0, 255));
+            C2D_DrawRectSolid(hx(&hud, center), y0, 0.5f, (ix + iw - center) * WORLD_S * z, hh, C2D_Color32(102, 255, 51, 255));
+            if (aIconD >= 0) {
+                float w = gIcons.frames[gIcons.anims[aIconD].frames[0]].fw / WORLD_S;
+                draw_centered(&hud, &gIcons, aIconD, health > 1.6f ? 1 : 0, center - (w - 26) + w / 2, barMid, iconScale, 1.0f,
+                    false);
+            }
             if (aIconP >= 0) {
-                /* icône du joueur retournée vers la gauche */
-                const SprAnim* a = &gIcons.anims[aIconP];
-                const SprFrame* fr = &gIcons.frames[a->frames[(health < 0.4f ? 1 : 0) % a->count]];
-                draw_frame(fr, HX(split + 14) - fr->fw * iconScale / 2, HY(barY) - fr->fh * iconScale / 2, iconScale, true, 1.0f);
+                float w = gIcons.frames[gIcons.anims[aIconP].frames[0]].fw / WORLD_S;
+                draw_centered(&hud, &gIcons, aIconP, health < 0.4f ? 1 : 0, center - 26 + w / 2, barMid, iconScale, 1.0f, true);
             }
+            float acc = pressedNotes ? accSum / pressedNotes : -1;
+            float ty = hud.down ? 720 - (by + 30) - 18 : by + 30;
+            uint32_t white = C2D_Color32(255, 255, 255, 255);
+            char accs[32];
+            if (acc < 0) snprintf(accs, sizeof(accs), "-%%");
+            else snprintf(accs, sizeof(accs), "%.2f%%", acc * 100);
+            hud_text(bx + 10, ty, 26, 0, white, true, "Accuracy:%s - [%s]", accs, rank_of(acc));
+            hud_text(640, ty, 26, 1, white, true, "Misses:%d", misses);
+            hud_text(bx + bw - 10, ty, 26, 2, white, true, "Score:%d", score);
         }
-        char sc[128];
-        text_score(sc, sizeof(sc), score, misses, hits ? accSum * 100.0f / hits : 0.0f);
-        draw_text_centered(200, barY + 9, 0.38f, C2D_Color32(255, 255, 255, 255), "%s", sc);
 
-        /* jugement */
-        if (ratingTime >= 0 && ratingTime < 600) {
-            static const char* RN[5] = {"", "sick", "good", "bad", "shit"};
-            int ra = spr_anim(&gMisc, RN[ratingAnim]);
-            float al = ratingTime < 300 ? 1.0f : 1.0f - (ratingTime - 300) / 300.0f;
-            if (ra >= 0) draw_centered(&gMisc, ra, 0, 200, 110 - ratingTime * 0.02f, 1.0f, al);
-        }
-        /* compte à rebours */
-        if (!started) {
-            int k = (int)floorf(-songPos / crochet0);
-            static const char* CD[3] = {"go", "set", "ready"};
-            if (k >= 0 && k < 3) {
-                int ca = spr_anim(&gMisc, CD[k]);
-                if (ca >= 0) draw_centered(&gMisc, ca, 0, 200, 120, 1.0f, 1.0f);
-            }
+        /* ready / set / go : descendent de 100 px et s'effacent sur un temps */
+        if (tick >= 1 && tick <= 3 && songPos < crochet0) {
+            static const char* CD[4] = {NULL, "ready", "set", "go"};
+            float in = (float)(songPos + crochet0 * 5.0) / crochet0 - 1 - tick;
+            int ca = spr_anim(&gMisc, CD[tick]);
+            float k = ease_cube_in_out(in < 0 ? 0 : in > 1 ? 1 : in);
+            Hud one = {1.0f, false};
+            if (ca >= 0) draw_centered(&one, &gMisc, ca, 0, 640, 360 + 100 * k, 1.0f, 1 - k, false);
         }
         if (dead) {
             C2D_DrawRectSolid(0, 0, 0.6f, SCREEN_W, SCREEN_H, C2D_Color32(0, 0, 0, 200));
             draw_text_centered(200, 90, 0.9f, C2D_Color32(255, 60, 60, 255), "GAME OVER");
-            draw_text_centered(200, 140, 0.5f, C2D_Color32(255, 255, 255, 255), "A : recommencer    B : quitter");
+            draw_text_centered(200, 140, 0.5f, C2D_Color32(255, 255, 255, 255), "A : retry    B : exit");
         }
 
         /* ---- écran du bas */
-        C2D_TargetClear(bottom, C2D_Color32(20, 16, 40, 255));
+        C2D_TargetClear(bottom, C2D_Color32(14, 12, 30, 255));
         C2D_SceneBegin(bottom);
-        draw_text_centered(160, 12, 0.7f, C2D_Color32(255, 255, 255, 255), "%s", chart.name);
-        draw_text(12, 50, 0.55f, C2D_Color32(255, 255, 255, 255), "Score : %d", score);
-        draw_text(12, 75, 0.55f, C2D_Color32(255, 255, 255, 255), "Rates : %d", misses);
-        draw_text(12, 100, 0.55f, C2D_Color32(255, 255, 255, 255), "Combo : %d", combo);
-        draw_text(12, 125, 0.55f, C2D_Color32(255, 255, 255, 255), "Precision : %.2f%%",
-            hits ? accSum * 100.0f / hits : 0.0f);
+        C2D_DrawRectSolid(0, 0, 0.5f, 320, 36, C2D_Color32(247, 1, 116, 255));
+        draw_text_centered(160, 8, 0.6f, C2D_Color32(255, 255, 255, 255), "%s", chart.name);
+        float accP = pressedNotes ? accSum * 100.0f / pressedNotes : 0.0f;
+        draw_text(16, 50, 0.55f, C2D_Color32(255, 255, 255, 255), "Score : %d", score);
+        draw_text(16, 75, 0.55f, C2D_Color32(255, 255, 255, 255), "Misses : %d", misses);
+        draw_text(16, 100, 0.55f, C2D_Color32(255, 255, 255, 255), "Combo : %d", combo);
+        draw_text(16, 125, 0.55f, C2D_Color32(255, 255, 255, 255), "Accuracy : %.2f%%  [%s]", accP,
+            rank_of(pressedNotes ? accSum / pressedNotes : -1));
         float len = haveInst ? inst.samples * 1000.0f / inst.rate : 1;
         float prog = started ? pos / len : 0;
         if (prog > 1) prog = 1;
-        C2D_DrawRectSolid(12, 160, 0.5f, 296, 10, C2D_Color32(60, 60, 90, 255));
-        C2D_DrawRectSolid(12, 160, 0.5f, 296 * prog, 10, C2D_Color32(146, 113, 253, 255));
-        draw_text(12, 180, 0.45f, C2D_Color32(180, 180, 220, 255), "Croix/ABXY/stick : fleches   START : pause");
+        C2D_DrawRectSolid(16, 160, 0.5f, 288, 8, C2D_Color32(60, 60, 90, 255));
+        C2D_DrawRectSolid(16, 160, 0.5f, 288 * prog, 8, C2D_Color32(2, 244, 240, 255));
+        draw_text(16, 180, 0.42f, C2D_Color32(180, 180, 220, 255), "D-Pad / ABXY / Circle Pad : arrows");
+        draw_text(16, 198, 0.42f, C2D_Color32(180, 180, 220, 255), "START : pause");
         if (paused) {
             C2D_DrawRectSolid(0, 0, 0.6f, 320, 240, C2D_Color32(0, 0, 0, 210));
-            static const char* PM[3] = {"Reprendre", "Recommencer", "Quitter"};
+            static const char* PM[3] = {"Resume", "Restart Song", "Exit to menu"};
             for (int i = 0; i < 3; i++)
                 draw_text_centered(160, 70 + i * 35, 0.7f,
                     i == pauseSel ? C2D_Color32(255, 230, 80, 255) : C2D_Color32(200, 200, 200, 255), "%s", PM[i]);
@@ -891,20 +1036,14 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
         if (gAutoTest) {
             static int frames;
             static u64 t0;
-            static float cpuMax, gpuMax;
             frames++;
-            float cpu = C3D_GetProcessingTime(), gpu = C3D_GetDrawingTime();
-            if (cpu > cpuMax) cpuMax = cpu;
-            if (gpu > gpuMax) gpuMax = gpu;
             if (!t0) t0 = now;
             double el = (now - t0) * 1.0 / SYSCLOCK_ARM11;
-            if (frames % 120 == 0) {
-                flog("t=%.1fs pos=%.0fms img/s=%.1f cpu=%.1fms(max %.1f) gpu=%.1fms(max %.1f) vie=%.2f rates=%d score=%d lin=%luKo",
-                    el, pos, frames / el, cpu, cpuMax, gpu, gpuMax, health, misses, score,
+            if (frames % 120 == 0)
+                flog("t=%.1fs pos=%.0fms img/s=%.1f cpu=%.1fms gpu=%.1fms vie=%.2f misses=%d score=%d lin=%luKo", el, pos,
+                    frames / el, C3D_GetProcessingTime(), C3D_GetDrawingTime(), health, misses, score,
                     (unsigned long)(linearSpaceFree() / 1024));
-                cpuMax = gpuMax = 0;
-            }
-            if (frames == 60 || frames == 600 || frames == 1500) {
+            if (frames == 60 || frames == 200 || frames == 700 || frames == 1500) {
                 gspWaitForVBlank();
                 char sp[300];
                 snprintf(sp, sizeof(sp), "sdmc:/3ds/fnf3ds/shot_%05d.bmp", frames);
@@ -919,13 +1058,19 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
 
     stream_close(&inst);
     stream_close(&voices);
+    sfx_stop_all();
     for (int i = 0; i < 3; i++)
         if (chars[i].loaded) spr_free(&chars[i].spr);
+    for (int side = 0; side < 2; side++)
+        if (gSkinLoaded[side]) {
+            spr_free(&gNotesSkin[side]);
+            gSkinLoaded[side] = false;
+        }
     for (int i = 0; i < stageCount; i++)
         if (!stage[i].isChar) spr_free(&stage[i].spr);
     free(stage);
     chart_free(&chart);
     if (outScore) *outScore = score;
-    if (outAccuracy) *outAccuracy = hits ? accSum * 100.0f / hits : 0.0f;
+    if (outAccuracy) *outAccuracy = pressedNotes ? accSum * 100.0f / pressedNotes : 0.0f;
     return result;
 }

@@ -71,6 +71,10 @@ bool stream_finished(Stream* s);
 void stream_volume(Stream* s, float v);
 void stream_close(Stream* s);
 void stream_pause(Stream* s, bool paused);
+void sfx_enable(bool on);
+void sfx_play(const char* path, float volume);
+void sfx_update(void);
+void sfx_stop_all(void);
 
 /* ---------------- jeu */
 typedef struct {
@@ -97,6 +101,8 @@ void draw_text(float x, float y, float size, uint32_t color, const char* fmt, ..
 void draw_text_centered(float cx, float y, float size, uint32_t color, const char* fmt, ...);
 
 typedef enum { GAME_QUIT, GAME_RESTART, GAME_DONE } GameResult;
+/* texte avec la police VCR du mod, coordonnées FNF (1280x720), align 0 gauche 1 centre 2 droite */
+void hud_text(float x, float y, float size, int align, uint32_t color, bool outline, const char* fmt, ...);
 void menu_run(C3D_RenderTarget* top, C3D_RenderTarget* bottom, bool audioOk);
 void flog(const char* fmt, ...);
 GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTarget* bottom,

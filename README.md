@@ -31,6 +31,7 @@ PC converter that reads the mod's **Codename Engine** files (charts, characters,
   - Story Mode (5 chapters, main and side stories)
   - Freeplay (song carousel, covers, difficulties, music preview, personal best, animated wave background)
   - Options (downscroll, ghost tapping)
+- Faithful to Codename Engine: character placement and camera, health bar and bouncing icons, Score/Misses/Accuracy with rank, rating popups and combo numbers, note splashes, per-character note skins, countdown and miss sounds, strum intro
 - Runs at **60 fps** on an Old 3DS. Installable as `.cia` (HOME menu icon and banner with sound) or `.3dsx`.
 
 ## Install (release)
@@ -69,7 +70,7 @@ powershell -File tools/build_cia.ps1                        # needs makerom
 
 ## Not supported yet
 GLSL shaders, video cutscenes, song mechanics that only exist as HScript, Adobe Animate texture atlases
-(e.g. girlfriend), per-character note skins.
+(e.g. girlfriend).
 
 ## Credits
 - **Friday Night Funkin'** by ninjamuffin99, PhantomArcade, evilsk8r and Kawai Sprite

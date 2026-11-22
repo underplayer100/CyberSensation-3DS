@@ -228,7 +228,7 @@ def convert_character(name, done):
         done[name] = None
         return None
     if SKIP_DONE and (OUT / "chars" / f"{name}.spr").exists():
-        done[name] = {"icon": a.get("icon", name)}
+        done[name] = {"icon": a.get("icon", name), "notesprite": a.get("notesprite", "default")}
         return done[name]
     print("  personnage", name)
     src = load_png(png)
@@ -266,6 +266,9 @@ def convert_character(name, done):
         "holdTime": float(a.get("holdTime", 4)), "scale": scale,
         "icon": a.get("icon", name),
         "gfDance": 1 if any(n[0] == "danceLeft" for n in ss.anims) else 0,
+        "notesprite": a.get("notesprite", "default"),
+        "interval": float(a.get("interval", 0)),
+        "color": a.get("color", ""),
     }
     ss.write(OUT / "chars" / f"{name}.spr")
     done[name] = ss.meta
@@ -368,13 +371,13 @@ def convert_stage(name, done):
 
 # ---------------------------------------------------------------- audio
 
-def convert_audio(src, dst):
+def convert_audio(src, dst, channels=2):
     if dst.exists() and dst.stat().st_mtime > src.stat().st_mtime:
         return
     raw = dst.with_suffix(".raw")
-    subprocess.run([FFMPEG, "-v", "error", "-y", "-i", str(src), "-ac", "2", "-ar", "32000",
+    subprocess.run([FFMPEG, "-v", "error", "-y", "-i", str(src), "-ac", str(channels), "-ar", "32000",
                     "-f", "s16le", str(raw)], check=True)
-    subprocess.run([str(ADPCM_ENC), str(raw), str(dst), "32000", "2"], check=True)
+    subprocess.run([str(ADPCM_ENC), str(raw), str(dst), "32000", str(channels)], check=True)
     raw.unlink()
 
 
@@ -495,14 +498,15 @@ def convert_song(song_dir, chars_done, stages_done, chart_p):
 
 # ---------------------------------------------------------------- interface
 
-def convert_ui():
-    print("interface")
-    ui = OUT / "ui"
-    # flèches
-    xml = find_asset("images/game/notes/default.xml")
+def convert_noteskin(skin):
+    xml = find_asset(f"images/game/notes/{skin}.xml")
+    png = find_asset(f"images/game/notes/{skin}.png")
+    if xml is None or png is None:
+        return
+    print("  fleches", skin)
     frames = parse_sparrow(xml)
-    src = load_png(find_asset("images/game/notes/default.png"))
-    ss = SpriteSet("ui_notes", S * HUD_NOTE_SCALE)
+    src = load_png(png)
+    ss = SpriteSet("ui_notes_" + re.sub(r"\W", "_", skin), S * HUD_NOTE_SCALE)
     for name in ["arrowLEFT", "arrowDOWN", "arrowUP", "arrowRIGHT",
                  "left press", "down press", "up press", "right press",
                  "left confirm", "down confirm", "up confirm", "right confirm",
@@ -512,7 +516,31 @@ def convert_ui():
         pref = prefix_frames(frames, name)
         idx = [ss.add_frame(src, frames[i]) for _, i in pref]
         ss.add_anim(name.rstrip("0"), 24, False, 0, 0, idx)
-    ss.write(ui / "notes.spr", "rgba8")
+    ss.write(OUT / "ui" / ("notes.spr" if skin == "default" else f"notes_{skin}.spr"), "rgba8")
+
+
+def convert_ui():
+    print("interface")
+    ui = OUT / "ui"
+    ui.mkdir(parents=True, exist_ok=True)
+    convert_noteskin("default")
+    # éclaboussures (splash) des SICK
+    xml = find_asset("images/game/splashes/default.xml")
+    if xml:
+        frames = parse_sparrow(xml)
+        src = load_png(find_asset("images/game/splashes/default.png"))
+        ss = SpriteSet("ui_splash", S * HUD_NOTE_SCALE)
+        for v in ("1", "2"):
+            for c in ("purple", "blue", "green", "red"):
+                idx = [ss.add_frame(src, frames[i]) for _, i in prefix_frames(frames, f"note impact {v} {c}")]
+                if idx:
+                    ss.add_anim(f"{v}{c}", 24, False, 0, 0, idx)
+        ss.write(ui / "splash.spr", "rgba8")
+    # sons de la partie (mono)
+    for n in ["intro3", "intro2", "intro1", "introGo", "missnote1", "missnote2", "missnote3"]:
+        p = find_asset(f"sounds/{n}.ogg")
+        if p:
+            convert_audio(p, ui / f"sfx_{n}.adp", 1)
     # barre de vie, jugements, chiffres, compte à rebours
     ss = SpriteSet("ui_misc", S)
     for n in ["healthBar", "score/sick", "score/good", "score/bad", "score/shit", "ready", "set", "go"] + \
@@ -523,7 +551,7 @@ def convert_ui():
         im = load_png(p)
         scale = 0.7 if n.startswith("score/") and "num" not in n else (0.5 if "num" in n else 1.0)
         if n in ("ready", "set", "go"):
-            scale = 0.8
+            scale = 0.6
         if scale != 1.0:
             im = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))), Image.LANCZOS)
         ss.add_anim(n.split("/")[-1], 24, False, 0, 0, [ss.add_image(im)])
@@ -615,7 +643,7 @@ def convert_menus():
     for n in ["scroll", "confirm", "cancel", "selected"]:
         p = find_asset(f"sounds/menu/{n}.ogg")
         if p:
-            convert_audio(p, ui / f"sfx_{n}.adp")
+            convert_audio(p, ui / f"sfx_{n}.adp", 1)
     p = find_asset("music/freakyMenu.ogg")
     if p:
         convert_audio(p, ui / "menu.adp")
@@ -672,6 +700,9 @@ def main():
                 e = None
             if e:
                 entries.append(e)
+    for skin in sorted(set(m.get("notesprite", "default") for m in chars_done.values() if m)):
+        if skin != "default":
+            convert_noteskin(skin)
     icons = [m["icon"] for m in chars_done.values() if m] + [e.split("|")[2] for e in entries]
     convert_icons(icons)
     (OUT / "songs.lst").write_text("\n".join(entries) + "\n", encoding="utf-8")
