@@ -6,6 +6,16 @@ This is not an emulator or a port of the PC executable. It is a small FNF engine
 PC converter that reads the mod's **Codename Engine** files (charts, characters, stages, menus, music) and turns them into
 3DS-friendly data.
 
+> **Download:** the [Releases page](https://github.com/underplayer100/CyberSensation-3DS/releases/latest) has a ready-to-play
+> `.cia` with the whole game inside. You do not need the PC game.
+
+## Game files and permission
+- The **source code** in this repository (engine and converter) contains no game or mod assets.
+- The **release packs** (`CyberSensation-3DS-full.cia`, `CyberSensation-3DS-SD.zip`) contain the art, music and charts of
+  *Cyber Sensation: Malware Breakout*, converted for the 3DS. They belong to the mod team and are shared with credit
+  (see Credits). Friday Night Funkin' assets are used under its own "do whatever you want" permission.
+- If you are part of the mod team and want the packs removed, open an issue and they will be taken down.
+
 ## Screenshots
 | Title screen | Main menu |
 |---|---|
@@ -35,7 +45,7 @@ PC converter that reads the mod's **Codename Engine** files (charts, characters,
   - main menu (random art, animated bar and spinning square)
   - Story Mode (5 chapters, main and side stories)
   - Freeplay (song carousel, covers, difficulties, music preview, personal best, animated wave background)
-  - Options (downscroll, ghost tapping)
+  - Options (downscroll, ghost tapping, button mapping for each arrow)
 - Faithful to Codename Engine: character placement and camera, health bar and bouncing icons, Score/Misses/Accuracy with rank, rating popups and combo numbers, note splashes, per-character note skins, countdown and miss sounds, strum intro
 - Runs at **60 fps** on an Old 3DS. Installable as `.cia` (HOME menu icon and banner with sound) or `.3dsx`.
 
@@ -49,12 +59,11 @@ Pick **one** of these:
 
 Your console needs `sdmc:/3ds/dspfirm.cdc` for sound (dump it with DSP1).
 If both exist, the SD card data is used before the data inside the full `.cia`.
-
-The **source code** in this repository contains no game or mod assets. The release packs contain the mod's art and
-music converted for the 3DS, credited below. If you are part of the mod team and want them removed, open an issue
-and they will be taken down.
+Updating from v1.0/v1.1: delete `sdmc:/3ds/fnf3ds/cyber/` first if you switch to the full `.cia`.
 
 ## Converting the mod
+Only needed to make the game files yourself (for example after a mod update). Players can use the release packs.
+
 Requirements: Python 3 with `pillow` and `numpy`, `ffmpeg` in PATH, devkitPro (`tex3ds`, `mkbcfnt`).
 
 ```
