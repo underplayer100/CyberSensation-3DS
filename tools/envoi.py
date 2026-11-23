@@ -18,8 +18,11 @@ def connect():
 
 
 def main():
+    cia = FNF / "CyberSensation-3DS.cia"  # tools/build_cia.ps1
+    if not cia.exists():
+        cia = FNF / "fnf3ds.cia"
     files = [
-        (FNF / "fnf3ds.cia", "/cia/fnf3ds.cia"),
+        (cia, "/cia/" + cia.name),
         (FNF / "fnf3ds.3dsx", "/3ds/fnf3ds.3dsx"),
     ]
     rest = [p for p in SD.rglob("*") if p.is_file()]

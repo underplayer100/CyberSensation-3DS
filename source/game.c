@@ -13,12 +13,14 @@ float gAutoSeconds = 60;
 void flog(const char* fmt, ...);
 void screenshot(const char* path);
 #define MAX_STAGE_SPRITES 48
+#define MAX_CHARS 6         /* 0 bf, 1 dad, 2 gf, 3+ persos créés par les scripts (new Character) */
 
 typedef struct {
     float time;
     uint8_t lane, type;
     float sLen;
     bool hit, missed, holding, holdDone;
+    bool hidden;            /* ligne de notes sans flèches à l'écran (ligne en plus) : chantée, pas dessinée */
 } Note;
 
 typedef struct {
@@ -45,6 +47,10 @@ typedef struct {
     float baseW, baseH;     /* taille du premier cadre (monde) */
     float scale, ow, oh;    /* échelle du XML, origine Flixel (centre du 1er cadre de l'atlas, non mis à l'échelle) */
     bool hidden;
+    float tint;             /* color = gris : 1 normal, 0.4 assombri à 40 % */
+    float alpha;            /* alpha du perso (scripts : apparitions, fondus) */
+    float twFrom, twTo, twStart, twDur;
+    float mvFrom[2], mvTo[2], mvStart, mvDur; /* déplacement (FlxTween sur x/y), mvDur < 0 : aucun */
     int aIdle, aLeft, aRight, aSing[4], aMiss[4], aAlt[4];
     bool alt;               /* événement Alt Animation Toggle */
     char noteSkin[32];
@@ -57,6 +63,17 @@ typedef struct {
     float x, y, scx, scy, scale, alpha;
     bool flip;
     float animTime;
+    int tile;               /* FlxBackdrop : 1 répété en X, 2 en Y */
+    float spx, spy, vx, vy; /* espacement entre copies, vitesse (px/s, monde) */
+    uint8_t kind;           /* 0 sprite, 2 rectangle uni (makeGraphic) */
+    uint8_t layer;          /* 1 : caméra ajoutée par un script, au-dessus du jeu, en coordonnées écran */
+    uint8_t before;         /* extra.stg : perso devant lequel insérer (0 bf, 1 dad, 2 gf, 255 à la fin) */
+    char name[33];          /* nom de l'élément, cible des événements "ev" de fix.txt */
+    uint32_t color;         /* rectangle : 0xAARRGGBB */
+    float w, h;             /* rectangle : taille monde (échelle comprise) */
+    float anchor;           /* >= 0 : animation calée sur la position de la chanson (ms), sinon horloge propre */
+    float twFrom, twTo, twStart, twDur; /* fondu d'alpha en cours (twDur < 0 : aucun) */
+    bool hidden;            /* visible = false */
 } StageItem;
 
 typedef struct {
@@ -113,7 +130,8 @@ static bool chart_load(Chart* c, const char* path) {
             Note* no = &c->notes[s][i];
             no->time = rdf(p);
             no->lane = p[4] & 3;
-            no->type = p[5];
+            no->type = p[5] & 0x7f;
+            no->hidden = (p[5] & 0x80) != 0;
             no->sLen = rdf(p + 8);
         }
     }
@@ -186,6 +204,10 @@ static bool char_load(Character* ch, const char* name, bool isPlayer) {
     snprintf(tex, sizeof(tex), "%s/tex", gModDir);
     if (!spr_load(&ch->spr, path, tex)) return false;
     ch->loaded = true;
+    ch->tint = 1.0f;
+    ch->alpha = 1.0f;
+    ch->twDur = -1.0f;
+    ch->mvDur = -1.0f;
     ch->isPlayer = isPlayer;
     bool playerOffsets = spr_metaf(&ch->spr, "isPlayer", 0) != 0;
     bool flipX = spr_metaf(&ch->spr, "flipX", 0) != 0;
@@ -284,17 +306,28 @@ static void world_to_screen(const Camera* cam, float wx, float wy, float scx, fl
     *sy = (fy - 360.0f) * cam->zoom * WORLD_S + SCREEN_H / 2.0f;
 }
 
-static void draw_frame(const SprFrame* fr, float sx, float sy, float scale, bool flip, float alpha) {
+/* light < 1 : couleur multipliée par light (fondu vers le noir de citro2d), comme sprite.color = gris dans Flixel */
+static void draw_frame_lit(const SprFrame* fr, float sx, float sy, float scale, bool flip, float alpha, float light) {
     if (alpha <= 0.003f) return;
     C2D_ImageTint tint;
-    C2D_AlphaImageTint(&tint, alpha > 1 ? 1 : alpha);
+    if (alpha > 1) alpha = 1;
+    if (light > 1.001f) /* colorTransform offset : fondu vers le blanc */
+        C2D_PlainImageTint(&tint, C2D_Color32(255, 255, 255, (u8)(alpha * 255)), light > 2 ? 1.0f : light - 1.0f);
+    else if (light < 0.999f)
+        C2D_PlainImageTint(&tint, C2D_Color32(0, 0, 0, (u8)(alpha * 255)), 1.0f - (light < 0 ? 0 : light));
+    else
+        C2D_AlphaImageTint(&tint, alpha);
     float w = fr->sub.width * scale, h = fr->sub.height * scale;
     float ox = flip ? (fr->fw - fr->ox - fr->sub.width) : fr->ox;
     float x0 = sx + ox * scale, y0 = sy + fr->oy * scale;
     if (x0 > SCREEN_W + 8 || x0 + w < -8 || y0 > SCREEN_H + 8 || y0 + h < -8) return;
     /* citro2d prend |w| à partir de pos.x : une largeur négative retourne l'image sur place */
     C2D_DrawParams p = {.pos = {x0, y0, flip ? -w : w, h}, .center = {0, 0}, .depth = 0.5f};
-    C2D_DrawImage(fr->img, &p, alpha < 1.0f ? &tint : NULL);
+    C2D_DrawImage(fr->img, &p, alpha < 1.0f || light < 0.999f || light > 1.001f ? &tint : NULL);
+}
+
+static void draw_frame(const SprFrame* fr, float sx, float sy, float scale, bool flip, float alpha) {
+    draw_frame_lit(fr, sx, sy, scale, flip, alpha, 1.0f);
 }
 
 static const SprFrame* anim_frame(const Spr* s, int anim, float timeMs, bool loop) {
@@ -321,7 +354,7 @@ static void char_draw(const Character* ch, const Camera* cam) {
     float by = ch->y + oh - s * oh - a->oy;
     float sx, sy;
     world_to_screen(cam, bx, by, ch->scx, ch->scy, &sx, &sy);
-    draw_frame(fr, sx, sy, cam->zoom, ch->flip, 1.0f);
+    draw_frame_lit(fr, sx, sy, cam->zoom, ch->flip, ch->alpha, ch->tint);
 }
 
 /* getCameraPosition : getMidpoint (x + width / 2, width = frameWidth * scale après updateHitbox)
@@ -377,6 +410,13 @@ static void apply_fixes(const char* songId, Character chars[3], float charPos[3]
                 chars[who].flip = fl;
                 chars[who].drawSwap = !chars[who].drawSwap;
             }
+        } else if (sscanf(line, "scroll %d %f %f", &who, &a, &b) == 3 && who >= 0 && who < 3) {
+            charPos[who][2] = a;
+            charPos[who][3] = b;
+        } else if (sscanf(line, "alpha %d %f", &who, &a) == 2 && who >= 0 && who < 3) {
+            chars[who].alpha = a;
+        } else if (sscanf(line, "tint %d %f", &who, &a) == 2 && who >= 0 && who < 3) {
+            chars[who].tint = a;
         } else if (sscanf(line, "hide %d", &who) == 1 && who >= 0 && who < 3) {
             chars[who].hidden = true;
         } else if (sscanf(line, "zoom %f", &a) == 1) {
@@ -493,6 +533,45 @@ typedef struct {
 /* boutons de chaque flèche : réglages du joueur (Options > Touches) */
 #define LANE_KEYS gSettings.laneKeys
 
+/* élément de décor : v1 58 octets, v2 + répétition (78), v3 + rectangle, calque, insertion, ancre (98) */
+static bool item_read(StageItem* s, const uint8_t* e, const char* tex) {
+    memset(s, 0, sizeof(*s));
+    memcpy(s->name, e + 1, 32);
+    s->name[32] = 0;
+    s->twDur = -1.0f;
+    s->anchor = -1.0f;
+    s->before = 255;
+    if (e[0] == 1) {
+        s->isChar = true;
+        s->charIndex = strcmp(s->name, "bf") == 0 ? 0 : strcmp(s->name, "dad") == 0 ? 1 : 2;
+        return true;
+    }
+    s->kind = e[0];
+    s->x = rdf(e + 33);
+    s->y = rdf(e + 37);
+    s->scx = rdf(e + 41);
+    s->scy = rdf(e + 45);
+    s->scale = rdf(e + 49);
+    s->alpha = rdf(e + 53);
+    s->flip = (e[57] & 1) != 0;
+    s->hidden = (e[57] & 2) != 0;  /* visible = false au départ */
+    s->tile = e[58];
+    s->spx = rdf(e + 62);
+    s->spy = rdf(e + 66);
+    s->vx = rdf(e + 70);
+    s->vy = rdf(e + 74);
+    memcpy(&s->color, e + 78, 4);
+    s->w = rdf(e + 82);
+    s->h = rdf(e + 86);
+    s->layer = e[90];
+    s->before = e[91];
+    s->anchor = rdf(e + 94);
+    if (s->kind == 2) return true;
+    char sp[400];
+    snprintf(sp, sizeof(sp), "%s/stages/%s.spr", gModDir, s->name);
+    return spr_load(&s->spr, sp, tex);
+}
+
 static bool stage_load(StageItem** items, int* count, float* zoom, float charPos[3][4], const char* name) {
     *items = NULL;
     *count = 0;
@@ -509,6 +588,9 @@ static bool stage_load(StageItem** items, int* count, float* zoom, float charPos
     if (f) {
         uint8_t h[12];
         if (fread(h, 1, 12, f) == 12 && memcmp(h, "FSTG", 4) == 0) {
+            uint32_t ver;
+            memcpy(&ver, h + 4, 4);
+            size_t isz = ver >= 3 ? 98 : ver >= 2 ? 78 : 58;
             *zoom = rdf(h + 8);
             for (int i = 0; i < 3; i++) {
                 float v[4];
@@ -517,29 +599,18 @@ static bool stage_load(StageItem** items, int* count, float* zoom, float charPos
             uint32_t cnt = 0;
             if (fread(&cnt, 4, 1, f) == 1) {
                 for (uint32_t i = 0; i < cnt && n < MAX_STAGE_SPRITES; i++) {
-                    uint8_t e[58];
-                    if (fread(e, 1, 58, f) != 58) break;
-                    StageItem* s = &it[n];
-                    char nm[33];
-                    memcpy(nm, e + 1, 32);
-                    nm[32] = 0;
-                    if (e[0] == 1) {
-                        s->isChar = true;
-                        s->charIndex = strcmp(nm, "bf") == 0 ? 0 : strcmp(nm, "dad") == 0 ? 1 : 2;
-                        haveChar[s->charIndex] = true;
-                        n++;
-                        continue;
+                    uint8_t e[98] = {0};
+                    if (fread(e, 1, isz, f) != isz) break;
+                    if (isz < 98) { /* anciens formats : pas d'ancre de temps, rien à insérer */
+                        memset(e + isz, 0, 98 - isz);
+                        float none = -1.0f;
+                        memcpy(e + 94, &none, 4);
+                        e[91] = 255;
                     }
-                    s->x = rdf(e + 33);
-                    s->y = rdf(e + 37);
-                    s->scx = rdf(e + 41);
-                    s->scy = rdf(e + 45);
-                    s->scale = rdf(e + 49);
-                    s->alpha = rdf(e + 53);
-                    s->flip = e[57] != 0;
-                    char sp[400];
-                    snprintf(sp, sizeof(sp), "%s/stages/%s.spr", gModDir, nm);
-                    if (spr_load(&s->spr, sp, tex)) n++;
+                    if (item_read(&it[n], e, tex)) {
+                        if (it[n].isChar) haveChar[it[n].charIndex] = true;
+                        n++;
+                    }
                 }
             }
         }
@@ -594,6 +665,193 @@ static void miss_sound(void) {
     play_ui_sfx(mn, frand(0.1f, 0.2f));
 }
 
+/* songs/<id>/extra.stg : sprites créés par les scripts de la chanson, insérés devant un perso ou à la fin */
+static void extras_load(StageItem** items, int* count, const char* songId) {
+    char path[384], tex[320];
+    snprintf(path, sizeof(path), "%s/songs/%s/extra.stg", gModDir, songId);
+    snprintf(tex, sizeof(tex), "%s/tex", gModDir);
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    uint8_t h[12];
+    uint32_t cnt = 0;
+    if (fread(h, 1, 12, f) == 12 && memcmp(h, "FSTX", 4) == 0) memcpy(&cnt, h + 8, 4);
+    if (cnt > 64) cnt = 64;
+    StageItem* it = realloc(*items, (*count + cnt + 1) * sizeof(StageItem));
+    if (!it) {
+        fclose(f);
+        return;
+    }
+    int n = *count;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint8_t e[98];
+        StageItem s;
+        if (fread(e, 1, 98, f) != 98) break;
+        if (!item_read(&s, e, tex)) continue;
+        int at = n;
+        if (s.before < 3 && !s.layer)
+            for (int k = 0; k < n; k++)
+                if (it[k].isChar && it[k].charIndex == s.before) {
+                    at = k;
+                    break;
+                }
+        memmove(&it[at + 1], &it[at], (n - at) * sizeof(StageItem));
+        it[at] = s;
+        n++;
+    }
+    fclose(f);
+    *items = it;
+    *count = n;
+}
+
+/* événements de pas extraits des stepHit/beatHit (fix.txt : "ev <pas> <genre> <cible> <valeur> <durée s>") */
+typedef struct {
+    float step;
+    uint8_t kind;            /* 0 alpha, 1 teinte, 2 flash, 3 chanteur, 4 déplacement, 5 miroir, 6 visible */
+    int target;              /* >= 0 élément du décor, -1 - k perso k ; chanteur : ligne de notes (0 joueur, 1 adversaire, 2 gf) */
+    float value, dur, y;     /* déplacement : x = value, y, durée ; 1e30 = inchangé */
+    uint32_t color;
+} StepEvent;
+
+static int timeline_load(const char* songId, const StageItem* items, int count, StepEvent** out) {
+    char path[384], line[128];
+    snprintf(path, sizeof(path), "%s/songs/%s/fix.txt", gModDir, songId);
+    *out = NULL;
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    int n = 0, cap = 0;
+    StepEvent* ev = NULL;
+    while (fgets(line, sizeof(line), f)) {
+        char kind[8], tgt[40];
+        float step, v, d = 0, d2 = 0;
+        if (sscanf(line, "ev %f %7s %39s %f %f %f", &step, kind, tgt, &v, &d, &d2) < 4) continue;
+        StepEvent e = {step, 0, -1, v, d, 0, 0};
+        if (!strcmp(kind, "flash")) {
+            e.kind = 2;
+            e.color = (uint32_t)strtoul(tgt, NULL, 16);
+            e.dur = v;
+        } else if (!strcmp(kind, "sing")) {
+            e.kind = 3;
+            e.target = atoi(tgt);
+        } else {
+            e.kind = !strcmp(kind, "tint") ? 1 : !strcmp(kind, "move") ? 4 : !strcmp(kind, "flip") ? 5
+                   : !strcmp(kind, "vis") ? 6 : 0;
+            if (e.kind == 4) e.y = d, e.dur = d2;
+            if (tgt[0] == '@') e.target = -1 - (tgt[1] - '0');
+            else {
+                e.target = -1000;
+                for (int i = 0; i < count; i++)
+                    if (!items[i].isChar && !strcmp(items[i].name, tgt)) {
+                        e.target = i;
+                        break;
+                    }
+                if (e.target == -1000) continue;
+            }
+        }
+        if (n == cap) {
+            cap = cap ? cap * 2 : 32;
+            ev = realloc(ev, cap * sizeof(StepEvent));
+        }
+        ev[n++] = e;
+    }
+    fclose(f);
+    /* tri par pas (insertion : stable, garde l'ordre du script pour un même pas) */
+    for (int i = 1; i < n; i++) {
+        StepEvent e = ev[i];
+        int j = i - 1;
+        while (j >= 0 && ev[j].step > e.step) ev[j + 1] = ev[j], j--;
+        ev[j + 1] = e;
+    }
+    *out = ev;
+    return n;
+}
+
+typedef struct {
+    uint32_t color;
+    float alpha, dur;
+} Flash;
+
+/* applique un événement de pas ; pos = position de la chanson (début des fondus) */
+static void step_event_apply(const StepEvent* e, Character* chars, int slot[3], StageItem* stage, Flash* fl, float pos) {
+    if (gAutoTest && e->kind >= 3)
+        flog("ev pas=%.0f genre=%d cible=%d v=%.1f y=%.1f d=%.2f", e->step, e->kind, e->target, e->value, e->y, e->dur);
+    if (e->kind == 2) {
+        fl->color = e->color;
+        fl->alpha = 1.0f;
+        fl->dur = e->dur > 0 ? e->dur * 1000.0f : 1000.0f;
+        return;
+    }
+    if (e->kind == 3) { /* dad = X : X chante les notes de cette ligne, la caméra le suit */
+        int k = (int)e->value;
+        if (e->target >= 0 && e->target < 3 && k >= 0 && k < MAX_CHARS && chars[k].loaded) slot[e->target] = k;
+        return;
+    }
+    if (e->target < 0) {
+        Character* c = &chars[-1 - e->target];
+        if (!c->loaded) return;
+        switch (e->kind) {
+        case 1: c->tint = e->value; break;
+        case 4:
+            c->mvFrom[0] = c->stageX, c->mvFrom[1] = c->stageY;
+            c->mvTo[0] = e->value > 1e29f ? c->stageX : e->value;
+            c->mvTo[1] = e->y > 1e29f ? c->stageY : e->y;
+            c->mvStart = pos, c->mvDur = e->dur * 1000.0f;
+            break;
+        case 5:
+            if ((e->value != 0) != c->flip) {
+                c->flip = e->value != 0;
+                c->drawSwap = !c->drawSwap;
+            }
+            break;
+        case 6: c->hidden = e->value == 0; break;
+        default: c->twFrom = c->alpha, c->twTo = e->value, c->twStart = pos, c->twDur = e->dur * 1000.0f;
+        }
+        return;
+    }
+    StageItem* si = &stage[e->target];
+    if (e->kind == 6) si->hidden = e->value == 0;
+    else if (e->kind == 0) si->twFrom = si->alpha, si->twTo = e->value, si->twStart = pos, si->twDur = e->dur * 1000.0f;
+}
+
+/* fix.txt "char <n> |<nom>| <x> <y> <joueur> <devant>" : persos créés par les scripts (new Character) */
+static void extra_chars_load(const char* songId, Character* chars, StageItem** items, int* count) {
+    char path[384], line[160];
+    snprintf(path, sizeof(path), "%s/songs/%s/fix.txt", gModDir, songId);
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        int k, player, before;
+        float x, y;
+        char name[64];
+        if (sscanf(line, "char %d |%63[^|]| %f %f %d %d", &k, name, &x, &y, &player, &before) != 6) continue;
+        if (k < 3 || k >= MAX_CHARS || !char_load(&chars[k], name, player != 0)) continue;
+        char_place(&chars[k], x, y, 1, 1);
+        StageItem* it = realloc(*items, (*count + 1) * sizeof(StageItem));
+        if (!it) continue;
+        int at = *count;
+        for (int i = 0; i < *count; i++)
+            if (it[i].isChar && it[i].charIndex == before) {
+                at = i;
+                break;
+            }
+        memmove(&it[at + 1], &it[at], (*count - at) * sizeof(StageItem));
+        memset(&it[at], 0, sizeof(StageItem));
+        it[at].isChar = true;
+        it[at].charIndex = k;
+        *items = it;
+        (*count)++;
+    }
+    fclose(f);
+}
+
+/* fondu linéaire d'alpha (les courbes FlxEase sont approchées par une droite) */
+static float tween_value(float from, float to, float start, float dur, float now, bool* done) {
+    float t = dur > 0 ? (now - start) / dur : 1.0f;
+    *done = t >= 1.0f;
+    if (t > 1) t = 1;
+    if (t < 0) t = 0;
+    return from + (to - from) * t;
+}
+
 GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTarget* bottom,
     int* outScore, float* outAccuracy) {
     char path[384];
@@ -616,7 +874,9 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     float stageZoom, charPos[3][4];
     stage_load(&stage, &stageCount, &stageZoom, charPos, chart.stage);
 
-    Character chars[3];   /* 0 bf, 1 dad, 2 gf */
+    Character chars[MAX_CHARS];   /* 0 bf, 1 dad, 2 gf, 3+ persos des scripts */
+    memset(chars, 0, sizeof(chars));
+    int slot[3] = {0, 1, 2};      /* perso qui chante chaque ligne : 0 joueur, 1 adversaire, 2 gf (dad = X) */
     /* isPlayer = stage.isCharFlipped(position) : vrai seulement à la position "boyfriend" */
     int posOf[3] = {0, 1, 2};
     read_slots(song->id, posOf);
@@ -628,6 +888,14 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     for (int i = 0; i < 3; i++) memcpy(slotPos[i], charPos[posOf[i]], sizeof(slotPos[i]));
     apply_fixes(song->id, chars, slotPos, &stageZoom, camFix);
     for (int i = 0; i < 3; i++) char_place(&chars[i], slotPos[i][0], slotPos[i][1], slotPos[i][2], slotPos[i][3]);
+    extras_load(&stage, &stageCount, song->id);
+    extra_chars_load(song->id, chars, &stage, &stageCount);
+    StepEvent* stepEv;
+    int stepEvCount = timeline_load(song->id, stage, stageCount, &stepEv), nextStepEv = 0;
+    Flash flash = {0, 0, 1};
+    /* pas <= -1000 : état initial réglé par create/postCreate (persos des scripts) */
+    while (nextStepEv < stepEvCount && stepEv[nextStepEv].step <= -1000)
+        step_event_apply(&stepEv[nextStepEv++], chars, slot, stage, &flash, 0);
 
     /* flèches propres au personnage de chaque côté (notesprite) */
     char tex[320];
@@ -655,6 +923,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
 
     Camera cam = {0, 0, stageZoom};
     float camTX, camTY;
+    int camSlot = 1;  /* ligne suivie par la caméra : 0 joueur, 1 adversaire, 2 gf */
     char_camera(chars[1].loaded ? &chars[1] : &chars[0], &camTX, &camTY);
     if (camFix[0].on) camTX = camFix[0].x, camTY = camFix[0].y;
     cam.x = camTX;
@@ -780,6 +1049,35 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
         float crochet = conductor_crochet(pos > 0 ? pos : 0);
         float stepCrochet = crochet / 4.0f;
 
+        /* événements de pas des scripts : fondus d'alpha, teintes, flashs */
+        if (pos >= 0) {
+            float stepNow = conductor_beat(pos) * 4.0f;
+            while (nextStepEv < stepEvCount && stepNow >= stepEv[nextStepEv].step)
+                step_event_apply(&stepEv[nextStepEv++], chars, slot, stage, &flash, pos);
+        }
+        for (int i = 0; i < MAX_CHARS; i++) {
+            Character* c = &chars[i];
+            bool done;
+            if (c->twDur >= 0) {
+                c->alpha = tween_value(c->twFrom, c->twTo, c->twStart, c->twDur, pos, &done);
+                if (done) c->twDur = -1;
+            }
+            if (c->mvDur >= 0) {
+                float x = tween_value(c->mvFrom[0], c->mvTo[0], c->mvStart, c->mvDur, pos, &done);
+                float y = tween_value(c->mvFrom[1], c->mvTo[1], c->mvStart, c->mvDur, pos, &done);
+                char_place(c, x, y, c->scx, c->scy);
+                if (done) c->mvDur = -1;
+            }
+        }
+        for (int i = 0; i < stageCount; i++) {
+            StageItem* si = &stage[i];
+            if (si->isChar || si->twDur < 0) continue;
+            bool done;
+            si->alpha = tween_value(si->twFrom, si->twTo, si->twStart, si->twDur, pos, &done);
+            if (done) si->twDur = -1;
+        }
+        if (flash.alpha > 0) flash.alpha -= dt / flash.dur;
+
         /* ---- compte à rebours : 3, 2 (ready), 1 (set), go */
         int tick = (int)floorf((float)(songPos + crochet0 * 5.0) / crochet0) - 1;
         if (!started && !paused && tick != lastTick && tick >= 0 && tick <= 3) {
@@ -793,13 +1091,10 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
             Event* e = &chart.events[nextEvent++];
             if (e->kind == 0) {
                 int t = (int)e->value;
-                Character* c = t == 1 ? &chars[0] : t == 2 ? &chars[2] : &chars[1];
-                int ti = t == 1 ? 1 : t == 2 ? 2 : 0;
-                if (camFix[ti].on) camTX = camFix[ti].x, camTY = camFix[ti].y;
-                else if (c->loaded) char_camera(c, &camTX, &camTY);
+                camSlot = t == 1 ? 0 : t == 2 ? 2 : 1;
             } else if (e->kind == 2) {
                 int v = (int)e->value, t = v / 2;
-                Character* c = t == 1 ? &chars[0] : t == 2 ? &chars[2] : &chars[1];
+                Character* c = &chars[slot[t == 1 ? 0 : t == 2 ? 2 : 1]];
                 c->alt = (v & 1) != 0;
             }
         }
@@ -813,7 +1108,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
         if (beat != lastBeat && !paused) {
             lastBeat = beat;
             int b = beat < 0 ? -beat : beat;
-            for (int i = 0; i < 3; i++) char_beat(&chars[i], b, stepCrochet, i == 0 && anyHeld);
+            for (int i = 0; i < MAX_CHARS; i++) char_beat(&chars[i], b, stepCrochet, i == slot[0] && anyHeld);
             if (started && beat % 4 == 0) {
                 cam.zoom += 0.015f;
                 hudZoom += 0.03f;
@@ -829,14 +1124,16 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                 if (!n->hit) {
                     n->hit = true;
                     if (n->type != 2)
-                        char_sing(n->type == 3 ? &chars[2] : n->type == 4 ? &chars[0] : &chars[1], n->lane, false, n->type == 1);
-                    strums[0][n->lane].anim = 2;
-                    strums[0][n->lane].time = 0;
+                        char_sing(&chars[slot[n->type == 3 ? 2 : n->type == 4 ? 0 : 1]], n->lane, false, n->type == 1);
+                    if (!n->hidden) {
+                        strums[0][n->lane].anim = 2;
+                        strums[0][n->lane].time = 0;
+                    }
                     if (haveVoices) stream_volume(&voices, 1.0f);
                 }
                 if (n->time + n->sLen < pos) nextNote[0] = i + 1;
-                else if (n->sLen > 0) {
-                    chars[1].holdTimer = 0;
+                else if (n->sLen > 0 && !n->hidden) {
+                    chars[slot[1]].holdTimer = 0;
                     strums[0][n->lane].anim = 2;
                 }
             }
@@ -874,7 +1171,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                         accSum += a;
                         health += hg;
                         if (best->type != 2)
-                            char_sing(best->type == 3 ? &chars[2] : best->type == 4 ? &chars[1] : &chars[0], l, false,
+                            char_sing(&chars[slot[best->type == 3 ? 2 : best->type == 4 ? 1 : 0]], l, false,
                                 best->type == 1);
                         strums[1][l].anim = 2;
                         strums[1][l].time = 0;
@@ -908,7 +1205,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                             misses++;
                             combo = 0;
                             score -= 10;
-                            char_sing(&chars[0], l, true, false);
+                            char_sing(&chars[slot[0]], l, true, false);
                             miss_sound();
                         }
                     }
@@ -921,7 +1218,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                 if (n->time > pos + HIT_WINDOW) break;
                 if (n->hit && n->holding) {
                     if ((held & LANE_KEYS[n->lane]) && pos < n->time + n->sLen) {
-                        chars[0].holdTimer = 0;
+                        chars[slot[0]].holdTimer = 0;
                         strums[1][n->lane].anim = 2;
                         health += 0.00023f * dt;
                     } else {
@@ -936,7 +1233,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                     pressedNotes++;
                     health -= 0.0475f;
                     score -= 10;
-                    char_sing(&chars[0], n->lane, true, false);
+                    char_sing(&chars[slot[0]], n->lane, true, false);
                     if (haveVoices) stream_volume(&voices, 0.0f);
                     miss_sound();
                 }
@@ -955,7 +1252,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
             }
             for (int s = 0; s < 2; s++)
                 for (int l = 0; l < 4; l++) strums[s][l].time += dt;
-            for (int i = 0; i < 3; i++) char_update(&chars[i], dt);
+            for (int i = 0; i < MAX_CHARS; i++) char_update(&chars[i], dt);
             for (int i = 0; i < stageCount; i++) stage[i].animTime += dt;
             for (int k = 0; k < 8; k++)
                 if (splashes[k].on && (splashes[k].t += dt) > 400) splashes[k].on = false;
@@ -973,6 +1270,13 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
 
         /* ---- caméra : suivi 0,04 et retour du zoom 0,05 par image à 60 i/s */
         float follow = 1.0f - powf(1.0f - 0.04f, dt / 16.67f);
+        /* moveCamera : chaque image, sur le perso qui chante la ligne visée (il peut changer ou bouger) */
+        {
+            int fi = camSlot == 0 ? 1 : camSlot == 1 ? 0 : 2;  /* camFix : indice de ligne de notes */
+            Character* c = &chars[slot[camSlot]];
+            if (camFix[fi].on) camTX = camFix[fi].x, camTY = camFix[fi].y;
+            else if (c->loaded && !c->hidden) char_camera(c, &camTX, &camTY);
+        }
         cam.x += (camTX - cam.x) * follow;
         cam.y += (camTY - cam.y) * follow;
         float back = 1.0f - powf(0.95f, dt / 16.67f);
@@ -992,13 +1296,72 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                 char_draw(&chars[s->charIndex], &cam);
                 continue;
             }
-            const SprFrame* fr = anim_frame(&s->spr, 0, s->animTime, true);
+            if (s->alpha <= 0.003f || s->hidden) continue;
+            if (s->kind == 2) {
+                /* rectangle uni (makeGraphic) */
+                float x0, y0, x1, y1;
+                if (s->layer) {
+                    x0 = s->x * WORLD_S, y0 = HUD_Y0 + s->y * WORLD_S;
+                    x1 = x0 + s->w * WORLD_S, y1 = y0 + s->h * WORLD_S;
+                } else {
+                    world_to_screen(&cam, s->x, s->y, s->scx, s->scy, &x0, &y0);
+                    x1 = x0 + s->w * cam.zoom * WORLD_S, y1 = y0 + s->h * cam.zoom * WORLD_S;
+                }
+                if (x0 < -4) x0 = -4;
+                if (y0 < -4) y0 = -4;
+                if (x1 > SCREEN_W + 4) x1 = SCREEN_W + 4;
+                if (y1 > SCREEN_H + 4) y1 = SCREEN_H + 4;
+                if (x1 <= x0 || y1 <= y0) continue;
+                float al = s->alpha > 1 ? 1 : s->alpha;
+                C2D_DrawRectSolid(x0, y0, 0.5f, x1 - x0, y1 - y0,
+                    C2D_Color32((s->color >> 16) & 255, (s->color >> 8) & 255, s->color & 255, (u8)(al * 255)));
+                continue;
+            }
+            /* ancre >= 0 : images jouées à la position de la chanson (shader pré-calculé) */
+            bool anchored = s->anchor >= 0;
+            const SprFrame* fr = anim_frame(&s->spr, 0, anchored ? pos - s->anchor : s->animTime, !anchored);
             if (!fr) continue;
             const SprAnim* a = &s->spr.anims[0];
             float sx, sy;
-            world_to_screen(&cam, s->x - a->ox, s->y - a->oy, s->scx, s->scy, &sx, &sy);
-            draw_frame(fr, sx, sy, cam.zoom * s->scale, s->flip, s->alpha);
+            float t = s->animTime / 1000.0f;
+            float z;
+            if (s->layer) {
+                sx = (s->x - a->ox) * WORLD_S, sy = HUD_Y0 + (s->y - a->oy) * WORLD_S;
+                z = s->scale;
+            } else {
+                world_to_screen(&cam, s->x - a->ox + s->vx * t, s->y - a->oy + s->vy * t, s->scx, s->scy, &sx, &sy);
+                z = cam.zoom * s->scale;
+            }
+            if (!s->tile) {
+                draw_frame(fr, sx, sy, z, s->flip, s->alpha);
+                continue;
+            }
+            /* FlxBackdrop : copies espacées de (largeur * échelle + espacement) jusqu'aux bords de l'écran */
+            float stepX = fr->fw * z + s->spx * cam.zoom * WORLD_S, stepY = fr->fh * z + s->spy * cam.zoom * WORLD_S;
+            if (stepX < 4) stepX = 4;
+            if (stepY < 4) stepY = 4;
+            float x0 = sx, y0 = sy;
+            int nx = 1, ny = 1;
+            if (s->tile & 1) {
+                x0 = fmodf(sx, stepX);
+                if (x0 > 0) x0 -= stepX;
+                nx = (int)((SCREEN_W - x0) / stepX) + 1;
+            }
+            if (s->tile & 2) {
+                y0 = fmodf(sy, stepY);
+                if (y0 > 0) y0 -= stepY;
+                ny = (int)((SCREEN_H - y0) / stepY) + 1;
+            }
+            for (int ty = 0; ty < ny && ty < 32; ty++)
+                for (int tx = 0; tx < nx && tx < 32; tx++)
+                    draw_frame(fr, x0 + tx * stepX, y0 + ty * stepY, z, s->flip, s->alpha);
         }
+
+        /* camGame.flash : couleur plein écran qui s'efface (sous le HUD) */
+        if (flash.alpha > 0)
+            C2D_DrawRectSolid(0, 0, 0.5f, SCREEN_W, SCREEN_H,
+                C2D_Color32((flash.color >> 16) & 255, (flash.color >> 8) & 255, flash.color & 255,
+                    (u8)((flash.alpha > 1 ? 1 : flash.alpha) * 255)));
 
         Hud flat = {hud.zoom, false};
         for (int k = 0; k < MAX_POPUPS; k++) {
@@ -1026,6 +1389,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
             int from = nextNote[s] > 8 ? nextNote[s] - 8 : 0;
             for (int i = from; i < chart.noteCount[s]; i++) {
                 Note* n = &ns[i];
+                if (n->hidden) continue;
                 float y = STRUM_CY + (n->time - pos) * pxPerMs;
                 if (y > 720 + 150) break;
                 float cx = lane_cx(s, n->lane);
@@ -1141,6 +1505,16 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
                 snprintf(sp, sizeof(sp), "sdmc:/3ds/fnf3ds/shot_%05d.bmp", frames);
                 screenshot(sp);
             }
+            /* captures à des positions fixes de la chanson : mêmes instants que tools/pc_ref (jeu PC) */
+            static const int AT_MS[] = {5000, 15000, 30000, 45000, 60000, 90000, 120000, 140000, 150000};
+            static int nextShot;
+            if (nextShot < (int)(sizeof(AT_MS) / sizeof(AT_MS[0])) && pos >= AT_MS[nextShot]) {
+                gspWaitForVBlank();
+                char sp[300];
+                snprintf(sp, sizeof(sp), "sdmc:/3ds/fnf3ds/shot_p%05d.bmp", AT_MS[nextShot]);
+                screenshot(sp);
+                nextShot++;
+            }
             if (el > gAutoSeconds) {
                 result = GAME_QUIT;
                 break;
@@ -1151,7 +1525,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     stream_close(&inst);
     stream_close(&voices);
     sfx_stop_all();
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < MAX_CHARS; i++)
         if (chars[i].loaded) spr_free(&chars[i].spr);
     for (int side = 0; side < 2; side++)
         if (gSkinLoaded[side]) {
@@ -1161,6 +1535,7 @@ GameResult game_play(const SongEntry* song, C3D_RenderTarget* top, C3D_RenderTar
     for (int i = 0; i < stageCount; i++)
         if (!stage[i].isChar) spr_free(&stage[i].spr);
     free(stage);
+    free(stepEv);
     chart_free(&chart);
     if (outScore) *outScore = score;
     if (outAccuracy) *outAccuracy = pressedNotes ? accSum * 100.0f / pressedNotes : 0.0f;

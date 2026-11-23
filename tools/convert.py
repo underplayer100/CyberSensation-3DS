@@ -529,6 +529,13 @@ class ScriptSprite:
         self.flip = False
         self.visible = True
         self.hud = False
+        self.tile = 0          # FlxBackdrop : 1 répété en X, 2 en Y, 3 les deux
+        self.rect = None       # makeGraphic : couleur 0xAARRGGBB (rectangle uni, sans image)
+        self.shader = None     # nom du shader (CustomShader / FunkinShader) appliqué au sprite
+        self.layer = 0         # 1 : caméra ajoutée par le script, dessinée au-dessus du jeu sans défilement
+        self.cam = None        # nom de cette caméra
+        self.spx = self.spy = 0.0
+        self.vx = self.vy = 0.0
 
     def load(self, path, atlas):
         self.path, self.atlas = path, atlas
@@ -606,15 +613,43 @@ def sprite_statement(o, rest):
         o.visible = False
     elif rest.replace(" ", "") == "visible=true":
         o.visible = True
-    elif rest.startswith("cameras") and "camGame" not in rest:
-        o.hud = True
+    elif (g := re.fullmatch(r"velocity\.set\(" + E + r"(?:, ?" + E + r")?\)", rest)):
+        a, b = safe_num(g.group(1)), safe_num(g.group(2)) if g.group(2) else None
+        if a is not None:
+            o.vx, o.vy = a, b if b is not None else a
+    elif (g := re.fullmatch(r"velocity\.([xy]) ?= ?" + E, rest)) and safe_num(g.group(2)) is not None:
+        setattr(o, "v" + g.group(1), safe_num(g.group(2)))
+    elif (g := re.fullmatch(r"makeGraphic\(" + E + r", ?" + E + r"(?:, ?" + E + r")?\)", rest)):
+        w, h = safe_num(g.group(1)), safe_num(g.group(2))
+        col = (g.group(3) or "0xFFFFFFFF").strip()
+        named = {"FlxColor.BLACK": 0xFF000000, "FlxColor.WHITE": 0xFFFFFFFF, "FlxColor.RED": 0xFFFF0000}
+        c = named.get(col, int(col, 16) if re.fullmatch(r"0x[0-9a-fA-F]+", col) else None)
+        if w and h and c is not None:
+            if c <= 0xFFFFFF:
+                c |= 0xFF000000
+            o.rect, o.path, o.atlas = c, None, False
+            o.fw, o.fh = o.width, o.height = w, h
+    elif re.match(r"blend ?=", rest):
+        o.hud = True  # mode de mélange (masque, addition...) : écarté plutôt que dessiné en opaque
+    elif rest.startswith("cameras") or rest.startswith("camera ="):
+        if re.search(r"camHUD|camNewHUD|camOther|camGameOver", rest):
+            o.hud = True
+        elif "camGame" not in rest:
+            o.layer = 1
+            cm = re.search(r"\[\s*(\w+)", rest)
+            o.cam = cm.group(1) if cm else None
 
 
-def run_stage_script(src, objects, order):
+def run_stage_script(src, objects, order, env=None):
     """Exécute les créations de sprites simples de create/postCreate.
-    objects : nom -> ScriptSprite ou clé de sprite XML ; order : liste ('char', tag) / ('spr', clé)."""
+    objects : nom -> ScriptSprite ou clé de sprite XML ; order : liste ('char', tag) / ('spr', clé).
+    env : valeurs connues remplacées dans les expressions (ex. "dad.x" -> 50)."""
     src = strip_comments(src)
     idxvars = {}
+    shaders = {}
+    env = env or {}
+    envrx = re.compile(r"(?<![\w.])(?:" + "|".join(re.escape(k) for k in sorted(env, key=len, reverse=True)) +
+                       r")(?![\w.])") if env else None
 
     def key_of(name):
         if name in CHARNAME:
@@ -635,9 +670,33 @@ def run_stage_script(src, objects, order):
         for st in executed(function_body(src, fn), {}):
             st = re.sub(r"\s+", " ", st).strip()
             st = re.sub(r"^var ", "", st)
+            if envrx:
+                st = envrx.sub(lambda m: repr(env[m.group(0)]), st)
+            m = re.match(r"(\w+)(?: ?: ?\w+)? = new (?:CustomShader|FunkinShader)\((?:Assets\.getText\(Paths\.fragShader\()?['\"](.+?)['\"]", st)
+            if m:
+                shaders[m.group(1)] = m.group(2)
+                continue
+            m = re.fullmatch(r"(\w+)\.shader ?= ?(\w+)", st)
+            if m and isinstance(objects.get(m.group(1)), ScriptSprite):
+                objects[m.group(1)].shader = shaders.get(m.group(2))
+                continue
             m = re.fullmatch(r"(\w+)(?: ?: ?\w+)? = members\.indexOf\((\w+)\)", st)
             if m:
                 idxvars[m.group(1)] = key_of(m.group(2))
+                continue
+            # FlxBackdrop(graphic, axes, spacingX, spacingY) : image répétée sur tout l'écran
+            m = re.match(r"(\w+)(?: ?: ?\w+)? = new FlxBackdrop\(Paths\.image\(['\"](.+?)['\"]\)(.*)\)$", st)
+            if m:
+                o = ScriptSprite(0, 0)
+                o.load(m.group(2), False)
+                rest = [v.strip() for v in m.group(3).split(",") if v.strip()]
+                ax = rest[0].replace("FlxAxes.", "") if rest else "XY"
+                o.tile = {"X": 1, "Y": 2, "XY": 3}.get(ax, 3)
+                if len(rest) > 1 and safe_num(rest[1]) is not None:
+                    o.spx = safe_num(rest[1])
+                if len(rest) > 2 and safe_num(rest[2]) is not None:
+                    o.spy = safe_num(rest[2])
+                objects[m.group(1)] = o
                 continue
             m = re.match(r"(\w+)(?: ?: ?\w+)? = new (?:FunkinSprite|FlxSprite)\((.*?)\)(.*)$", st)
             if m:
@@ -669,6 +728,100 @@ def run_stage_script(src, objects, order):
                 k = ("char", CHARNAME[m.group(1)])
                 if k in order:
                     order.remove(k)
+
+
+def item(name, x, y, scx=1.0, scy=1.0, sc=1.0, alpha=1.0, flip=0, **kw):
+    """Élément de décor (format FSTG v3)."""
+    d = {"name": name, "x": x, "y": y, "scx": scx, "scy": scy, "sc": sc, "alpha": alpha, "flip": flip,
+         "tile": (0, 0, 0, 0, 0), "kind": 0, "color": 0, "w": 0.0, "h": 0.0, "layer": 0, "before": 255, "anchor": -1.0}
+    d.update(kw)
+    return d
+
+
+CHAR_CODE = {"boyfriend": "bf", "dad": "dad", "girlfriend": "gf"}
+BEFORE_CODE = {"boyfriend": 0, "dad": 1, "girlfriend": 2}
+
+
+def pack_item(r, char=None):
+    """98 octets : genre (0 sprite, 1 perso, 2 rectangle), nom, position, défilement, échelle, alpha, miroir,
+    répétition (FlxBackdrop), couleur et taille (rectangle), calque, perso devant lequel insérer, ancre de temps."""
+    if char is not None:
+        return struct.pack("<B", 1) + fstr(CHAR_CODE[char]) + bytes(98 - 33)
+    b = struct.pack("<B", r["kind"]) + fstr(r["name"])
+    b += struct.pack("<ffffffB", r["x"], r["y"], r["scx"], r["scy"], r["sc"], r["alpha"], r["flip"])
+    b += struct.pack("<Bxxxffff", *r["tile"])
+    b += struct.pack("<IffBBxxf", r["color"] & 0xFFFFFFFF, r["w"], r["h"], r["layer"], r["before"], r["anchor"])
+    assert len(b) == 98
+    return b
+
+
+def build_script_items(objects, order, prefix, first, keep=(), windows=None, shader_cams=()):
+    """Sprites créés par un script -> éléments de décor. keep : variables gardées même invisibles au départ
+    (un événement les fait apparaître) ; windows : variable -> (début, fin) en ms pour les shaders pré-calculés."""
+    import shaders as shd
+    records = {}
+    for var, o in objects.items():
+        if not isinstance(o, ScriptSprite) or ("spr", var) not in order:
+            continue
+        hidden = not o.visible or o.alpha <= 0.01
+        rendered = o.shader in shd.RENDERERS and windows and var in windows
+        shaded_cam = o.layer and o.cam in shader_cams and not rendered
+        if o.hud or shaded_cam or (hidden and var not in keep) or (o.path is None and o.rect is None):
+            order.remove(("spr", var))
+            continue
+        nm = f"{prefix}{first + len(records)}"
+        sx, sy = abs(o.sx) or 1.0, abs(o.sy) or abs(o.sx) or 1.0
+        alpha = min(max(o.alpha, 0.0), 1.0)
+        hid = 0 if o.visible else 2  # bit 1 de l'octet miroir : caché au départ (visible = false)
+        if rendered:
+            # shader pré-calculé : images plein écran jouées à la position de la chanson
+            t0, t1 = windows[var]
+            ss = SpriteSet(nm, 1.0)
+            fps, w, h = 10, 192, 108
+            n = int((t1 - t0) / 1000 * fps) + 1
+            if SKIP_DONE and (OUT / "stages" / f"{nm}.spr").exists():
+                records[var] = item(nm, 0, 0, 0, 0, 400.0 / w, alpha, 0, layer=1, anchor=float(t0))
+                continue
+            print(f"    shader {o.shader} pré-calculé : {n} images {w}x{h}")
+            ss.add_anim("idle", fps, False, 0, 0, [ss.add_image(shd.RENDERERS[o.shader](t0 / 1000 + 2.0 + k / fps, w, h))
+                                                   for k in range(n)])
+            ss.write(OUT / "stages" / f"{nm}.spr", "etc1")
+            records[var] = item(nm, 0, 0, 0, 0, 400.0 / w, alpha, 0, layer=1, anchor=float(t0))
+            continue
+        if o.rect is not None:
+            # rectangle uni : taille finale, mise à l'échelle autour du centre comme Flixel
+            w, h = o.fw * sx, o.fh * sy
+            px = o.x - o.offx + o.fw / 2 * (1 - sx)
+            py = o.y - o.offy + o.fh / 2 * (1 - sy)
+            records[var] = item("rect_" + nm, px, py, o.scx, o.scy, 1.0, alpha * ((o.rect >> 24) / 255), hid,
+                                kind=2, color=o.rect, w=w, h=h, layer=o.layer)
+            print(f"    rectangle de script {var} #{o.rect:08X}")
+            continue
+        png = find_asset(f"images/{o.path}.png")
+        sxml = find_asset(f"images/{o.path}.xml") if o.atlas else None
+        frames = parse_sparrow(sxml) if sxml else None
+        anims = sorted(o.anims, key=lambda t: t[0] != o.play) if o.play else list(o.anims)
+        s = sx
+        try:
+            img = load_png(png)
+            if frames is None and abs(sy - s) > 1e-3:
+                # échelle non uniforme : l'image est étirée d'avance, le SpriteSet garde une échelle unique
+                img = img.resize((img.width, max(1, round(img.height * sy / s))), Image.LANCZOS)
+            ss, ow, oh, fit = build_stage_sprite(nm, img, frames, anims, s)
+            if frames is None:
+                oh = o.fh / 2
+            ss.write(OUT / "stages" / f"{ss.name}.spr")
+        except Exception as ex:
+            print(f"    sprite de script {var} ignoré ({ex})")
+            order.remove(("spr", var))
+            continue
+        # écran = x - offset + origin + scale * (pixel - origin)
+        px = o.x - o.offx + ow * (1 - s)
+        py = o.y - o.offy + oh * (1 - (abs(o.sy) or s))
+        records[var] = item(ss.name, px, py, o.scx, o.scy, 1.0 / fit, alpha, (1 if o.flip else 0) | hid,
+                            tile=(o.tile, o.spx, o.spy, o.vx, o.vy), layer=o.layer)
+        print(f"    sprite de script {var} ({o.path})")
+    return records
 
 
 def convert_stage(name, done):
@@ -732,55 +885,27 @@ def convert_stage(name, done):
             px += ow * (1 - scale)
             py += oh * (1 - scale)
         key = a.get("name") or f"#{len(records)}"
-        records[key] = (ss.name, px, py, scx, scy, 1.0 / fit, float(a.get("alpha", 1)),
-                        1 if a.get("flipX") == "true" else 0)
+        records[key] = item(ss.name, px, py, scx, scy, 1.0 / fit, float(a.get("alpha", 1)),
+                            1 if a.get("flipX") == "true" else 0)
         objects[key] = key
         order.append(("spr", key))
     if hx is not None:
-        run_stage_script(hx.read_text(encoding="utf-8-sig", errors="replace"), objects, order)
-        for var, o in objects.items():
-            if not isinstance(o, ScriptSprite) or ("spr", var) not in order:
-                continue
-            if o.path is None or o.hud or not o.visible or o.alpha <= 0.01:
-                order.remove(("spr", var))
-                continue
-            png = find_asset(f"images/{o.path}.png")
-            sxml = find_asset(f"images/{o.path}.xml") if o.atlas else None
-            frames = parse_sparrow(sxml) if sxml else None
-            anims = sorted(o.anims, key=lambda t: t[0] != o.play) if o.play else list(o.anims)
-            s = abs(o.sx) or 1.0
-            sy = abs(o.sy) or s
-            try:
-                img = load_png(png)
-                if frames is None and abs(sy - s) > 1e-3:
-                    # échelle non uniforme : l'image est étirée d'avance, le SpriteSet garde une échelle unique
-                    img = img.resize((img.width, max(1, round(img.height * sy / s))), Image.LANCZOS)
-                ss, ow, oh, fit = build_stage_sprite(f"stg_{sname}_{len(records)}", img, frames, anims, s)
-                if frames is None:
-                    oh = o.fh / 2
-                ss.write(OUT / "stages" / f"{ss.name}.spr")
-            except Exception as ex:
-                print(f"    sprite de script {var} ignoré ({ex})")
-                order.remove(("spr", var))
-                continue
-            # écran = x - offset + origin + scale * (pixel - origin)
-            px = o.x - o.offx + ow * (1 - s)
-            py = o.y - o.offy + oh * (1 - (abs(o.sy) or s))
-            records[var] = (ss.name, px, py, o.scx, o.scy, 1.0 / fit, min(o.alpha, 1.0), 1 if o.flip else 0)
-            print(f"    sprite de script {var} ({o.path})")
+        src = hx.read_text(encoding="utf-8-sig", errors="replace")
+        run_stage_script(src, objects, order)
+        cams = set(re.findall(r"(\w+)\.(?:addShader|setFilters)\(", src))
+        records.update(build_script_items(objects, order, f"stg_{sname}_", len(records),
+                                          shown_by_events(step_events(src)), None, cams))
     order = [k for k in order if k[0] == "char" or k[1] in records]
-    b = bytearray(b"FSTG") + struct.pack("<If", 1, zoom)
+    b = bytearray(b"FSTG") + struct.pack("<If", 3, zoom)
     for k in ("boyfriend", "dad", "girlfriend"):
         b += struct.pack("<ffff", *chars[k])
     b += struct.pack("<I", len(order))
     for kind, v in order:
-        if kind == "char":
-            b += struct.pack("<B", 1) + fstr({"boyfriend": "bf", "dad": "dad", "girlfriend": "gf"}[v]) + \
-                struct.pack("<ffffffB", 0, 0, 0, 0, 0, 0, 0)
-        else:
-            n, x, y, scx, scy, sc, al, fl = records[v]
-            b += struct.pack("<B", 0) + fstr(n) + struct.pack("<ffffffB", x, y, scx, scy, sc, al, fl)
+        b += pack_item(records[v] if kind == "spr" else None, v if kind == "char" else None)
+    # variable du script -> nom de l'élément, pour les événements des chansons (fix.txt "ev ...")
     (OUT / "stages").mkdir(parents=True, exist_ok=True)
+    (OUT / "stages" / f"{name}.vars").write_text(
+        "".join(f"{k} {records[k]['name']}\n" for kind, k in order if kind == "spr"), encoding="utf-8")
     (OUT / "stages" / f"{name}.stg").write_bytes(b)
 
 
@@ -839,6 +964,14 @@ def eval_condition(cond, ctx):
         return bool(eval(c, {"__builtins__": {}}))
     except Exception:
         return None
+
+
+def expand_chain(st):
+    """Affectation en chaîne de propriétés -> une instruction par cible."""
+    parts = [x.strip() for x in st.split("=")]
+    if len(parts) > 2 and all(re.fullmatch(r"[\w.]+", x) for x in parts[:-1]) and "==" not in st:
+        return [f"{x} = {parts[-1]}" for x in parts[:-1]]
+    return [st]
 
 
 def executed(body, ctx):
@@ -931,8 +1064,10 @@ def executed(body, ctx):
                 break
             j += 1
         st = body[i:j].strip()
-        if st and "{" not in st and not re.match(r"(for|while|switch|else|function|return)\b", st):
-            out.append(st)
+        # accolades acceptées seulement dans un appel (FlxTween.tween(x, {alpha: 1}, ...)), pas pour un bloc
+        braces_ok = "{" not in st or re.match(r"[\w.]+\(", st) and st.index("(") < st.index("{")
+        if st and braces_ok and not re.match(r"(for|while|switch|else|function|return|if)\b", st):
+            out += expand_chain(st)
         i = j + 1
     return out
 
@@ -979,6 +1114,21 @@ def script_fixes(src, ctx=None):
                 op = {"=": "set", "+=": "add", "-=": "sub"}[m.group(4)]
                 res.append(f"{op} {kind} {WHO[m.group(1)]} {m.group(5)}")
                 continue
+            m = re.fullmatch(r"(\w+)\.scrollFactor\.set\( ?" + NUM + r"(?: ?, ?" + NUM + r")? ?\)", st)
+            if m and m.group(1) in WHO:
+                res.append(f"scroll {WHO[m.group(1)]} {m.group(2)} {m.group(3) or m.group(2)}")
+                continue
+            ops = alpha_assign(st)
+            if ops:
+                for who, v in ops:
+                    if who in WHO:
+                        res.append(f"alpha {WHO[who]} {v}")
+                continue
+            # color = FlxColor.fromHSL(hue, saturation, L, a) sur un perso blanc : gris L, l'image est multipliée par L
+            m = re.fullmatch(r"(\w+)\.color ?= ?FlxColor\.fromHSL\(.*?, ?" + NUM + r" ?(?:, ?" + NUM + r" ?)?\)", st)
+            if m and m.group(1) in WHO:
+                res.append(f"tint {WHO[m.group(1)]} {m.group(2)}")
+                continue
             m = re.fullmatch(r"(\w+)\.visible ?= ?false", st)
             if m and m.group(1) in WHO:
                 res.append(f"hide {WHO[m.group(1)]}")
@@ -1003,6 +1153,278 @@ def script_fixes(src, ctx=None):
             res.append(f"camfix {m.group(1)} {m.group(2)} {m.group(3)}")
         break
     return phases
+
+
+def alpha_assign(st):
+    """'a.alpha = b.alpha = 0.5' -> [('a', 0.5), ('b', 0.5)]"""
+    parts = [x.strip() for x in st.split("=")]
+    if len(parts) < 2 or not all(re.fullmatch(r"\w+\.alpha", x) for x in parts[:-1]):
+        return None
+    v = safe_num(parts[-1])
+    return None if v is None else [(x[:-6], v) for x in parts[:-1]]
+
+
+FLASH_COLORS = {"WHITE": 0xFFFFFFFF, "BLACK": 0xFF000000, "RED": 0xFFFF0000}
+
+
+def timeline_ops(st):
+    """Instruction d'un stepHit -> opérations ('alpha', var, valeur, durée s) / ('tint', var, L) / ('flash', couleur, durée)."""
+    st = re.sub(r"\s+", " ", st).strip()
+    ops = alpha_assign(st)
+    if ops:
+        return [("alpha", v, x, 0.0) for v, x in ops]
+    m = re.fullmatch(r"(dad|boyfriend|bf|gf|girlfriend) ?= ?(\w+)", st)
+    if m:  # PlayState.set_dad : la ligne de notes est chantée par ce perso
+        return [("assign", m.group(1), m.group(2))]
+    m = re.match(r"FlxTween\.tween\((\w+), ?\{([^}]*)\}, ?([\d.]+)", st)
+    if m:
+        out = []
+        props = dict(re.findall(r"\b(\w+) ?: ?([^,}]+)", m.group(2)))
+        if "alpha" in props and safe_num(props["alpha"]) is not None:
+            out.append(("alpha", m.group(1), safe_num(props["alpha"]), float(m.group(3))))
+        x, y = safe_num(props.get("x")), safe_num(props.get("y"))
+        if x is not None or y is not None:
+            out.append(("move", m.group(1), x, y, float(m.group(3))))
+        return out
+    m = re.fullmatch(r"(\w+)\.setPosition\( ?" + NUM + r" ?, ?" + NUM + r" ?\)", st)
+    if m:
+        return [("move", m.group(1), float(m.group(2)), float(m.group(3)), 0.0)]
+    m = re.fullmatch(r"(\w+)\.([xy]) ?= ?" + NUM, st)
+    if m:
+        v = float(m.group(3))
+        return [("move", m.group(1), v if m.group(2) == "x" else None, v if m.group(2) == "y" else None, 0.0)]
+    m = re.fullmatch(r"(\w+)\.flipX ?= ?(true|false)", st)
+    if m:
+        return [("flip", m.group(1), m.group(2) == "true")]
+    m = re.fullmatch(r"(\w+)\.visible ?= ?(true|false)", st)
+    if m:
+        return [("vis", m.group(1), m.group(2) == "true")]
+    m = re.fullmatch(r"(\w+)\.color ?= ?FlxColor\.fromHSL\(.*?, ?" + NUM + r" ?(?:, ?" + NUM + r" ?)?\)", st)
+    if m:
+        return [("tint", m.group(1), float(m.group(2)))]
+    # colorTransform.xxxOffset = 255 (silhouette blanche) : teinte > 1 = fondu vers le blanc (2 = blanc pur)
+    m = re.fullmatch(r"(\w+)\.colorTransform\.\w+Offset ?= ?(?:\w+\.colorTransform\.\w+Offset ?= ?)*" + NUM, st)
+    if m:
+        return [("tint", m.group(1), 1.0 + min(max(float(m.group(2)), 0.0), 255.0) / 255.0)]
+    m = re.match(r"(?:camGame|FlxG\.camera)\.flash\((?:FlxColor\.(\w+)|(0x[0-9A-Fa-f]+))?(?: ?, ?([\d.]+))?", st)
+    if m:
+        c = FLASH_COLORS.get(m.group(1) or "", int(m.group(2), 16) if m.group(2) else 0xFFFFFFFF)
+        return [("flash", c, float(m.group(3) or 1))]
+    return []
+
+
+def step_events(src):
+    """stepHit/beatHit : switch (curStep) { case N: ... } et if (curStep == N) {...} -> [(pas, opération)]."""
+    src = strip_comments(src)
+    out = []
+    body = function_body(src, "onSongStart")
+    for st in executed(body, {}):
+        for op in timeline_ops(st):
+            out.append((0, op))
+    # new FlxTimer().start(3, function(tmr) { ... }) : instructions retardées (pas = ("ms", délai))
+    for m in re.finditer(r"new FlxTimer\(\)\.start\(\s*" + NUM + r"\s*,\s*function\s*\([^)]*\)\s*\{", body):
+        seg = body[m.end():_balanced(body, m.end() - 1, "{", "}") - 1]
+        for st in executed(seg, {}):
+            for op in timeline_ops(st):
+                out.append((("ms", float(m.group(1)) * 1000), op))
+    for fn, var, mul in (("stepHit", "curStep", 1), ("beatHit", "curBeat", 4)):
+        body = function_body(src, fn)
+        if not body:
+            continue
+        for sw in re.finditer(r"switch\s*\(\s*" + var + r"\s*\)\s*\{", body):
+            block = body[sw.end():_balanced(body, sw.end() - 1, "{", "}") - 1]
+            labels = list(re.finditer(r"\bcase\s+([\d,\s]+):|\bdefault\s*:", block))
+            for i, lb in enumerate(labels):
+                if not lb.group(1):
+                    continue
+                seg = block[lb.end():labels[i + 1].start() if i + 1 < len(labels) else len(block)]
+                for st in executed(seg, {}):
+                    for op in timeline_ops(st):
+                        for n in re.findall(r"\d+", lb.group(1)):
+                            out.append((int(n) * mul, op))
+        for m in re.finditer(r"if\s*\(\s*" + var + r"\s*==\s*(\d+)\s*\)\s*\{", body):
+            seg = body[m.end():_balanced(body, m.end() - 1, "{", "}") - 1]
+            for st in executed(seg, {}):
+                for op in timeline_ops(st):
+                    out.append((int(m.group(1)) * mul, op))
+    return out
+
+
+def step_to_ms(step, bpm, changes):
+    """Pas -> ms avec les changements de BPM [(ms, bpm)]."""
+    t, beat, cur = 0.0, 0.0, bpm
+    target = step / 4.0
+    for ms, b in changes:
+        nb = beat + (ms - t) * cur / 60000.0
+        if nb >= target:
+            break
+        t, beat, cur = ms, nb, b
+    return t + (target - beat) * 60000.0 / cur
+
+
+def shown_by_events(raw):
+    """Variables qu'un événement fait apparaître (alpha > 0 ou visible = true) : gardées même cachées au départ."""
+    return {op[1] for _, op in raw if (op[0] == "alpha" and op[2] > 0) or (op[0] == "vis" and op[2])}
+
+
+def song_extras(song_dir, stage, sid, out, bpm, changes, fixes, names=("", "", ""), chars_done=None):
+    """Sprites créés par les scripts de la chanson (songs/<id>/extra.stg) et événements de pas (lignes "ev")."""
+    # positions des persos (décor converti + repositionnements des scripts), pour "dad.x" etc. dans les scripts
+    pos = [[0.0, 0.0] for _ in range(3)]
+    stg = OUT / "stages" / f"{stage}.stg"
+    if stg.exists():
+        b = stg.read_bytes()
+        for k in range(3):
+            pos[k] = list(struct.unpack_from("<ff", b, 12 + 16 * k))
+    for f in fixes:
+        p = f.split()
+        if p[0] == "pos":
+            pos[int(p[1])] = [float(p[2]), float(p[3])]
+        elif p[0] in ("set", "add", "sub") and p[1] in ("x", "y"):
+            i, v = (0 if p[1] == "x" else 1), float(p[3])
+            pos[int(p[2])][i] = v if p[0] == "set" else pos[int(p[2])][i] + (v if p[0] == "add" else -v)
+    env = {}
+    for who, k in WHO.items():
+        env[f"{who}.x"], env[f"{who}.y"] = pos[k]
+    stage_vars = {}
+    vf = OUT / "stages" / f"{stage}.vars"
+    if vf.exists():
+        for l in vf.read_text(encoding="utf-8").splitlines():
+            if " " in l:
+                k, v = l.split(" ", 1)
+                stage_vars[k] = v
+    files = []
+    st = find_asset(f"data/stages/{stage}.hx")
+    if st:
+        files.append((st, True))
+    files += [(f, False) for f in sorted((song_dir / "scripts").glob("*.hx"))] if (song_dir / "scripts").is_dir() else []
+    objects = {}
+    order = [("char", "girlfriend"), ("char", "dad"), ("char", "boyfriend")]
+    raw = []
+    extra = {}       # variable -> (indice 3+, nom, x, y, joueur, devant)
+    reflections = set()
+    char_lines = []
+    envrx = re.compile(r"(?<![\w.])(?:" + "|".join(re.escape(k) for k in sorted(env, key=len, reverse=True)) +
+                       r")(?![\w.])")
+    for f, is_stage in files:
+        src = f.read_text(encoding="utf-8-sig", errors="replace")
+        raw += step_events(src)
+        if not is_stage:
+            run_stage_script(src, objects, order, env)
+        # new Character(x, y, "nom"[, joueur]) dans create/postCreate, inséré devant un perso
+        for fn in ("create", "postCreate"):
+            for st in executed(function_body(strip_comments(src), fn), {}):
+                st = envrx.sub(lambda m: repr(env[m.group(0)]), re.sub(r"\s+", " ", st).strip())
+                m = re.fullmatch(r"(?:var )?(\w+)(?: ?: ?\w+)? = new Character\((.*)\)", st)
+                if m and len(extra) < 3:
+                    args = [a.strip() for a in m.group(2).split(",")]
+                    nm = args[2].strip("'\"") if len(args) > 2 else ""
+                    cm = re.fullmatch(r"(\w+)\.curCharacter", args[2]) if len(args) > 2 else None
+                    if cm and cm.group(1) in WHO:
+                        nm = names[{0: 1, 1: 0, 2: 2}[WHO[cm.group(1)]]]
+                    x, y = safe_num(args[0]), safe_num(args[1]) if len(args) > 1 else None
+                    if nm and x is not None and y is not None and convert_character(nm, chars_done if chars_done is not None else {}):
+                        player = len(args) > 3 and args[3] == "true"
+                        extra[m.group(1)] = [3 + len(extra), nm, x, y, player, 255]
+                    continue
+                m = re.fullmatch(r"insert\(members\.indexOf\((\w+)\), ?(\w+)\)", st)
+                if m and m.group(2) in extra and m.group(1) in CHARNAME:
+                    extra[m.group(2)][5] = BEFORE_CODE[CHARNAME[m.group(1)]]
+                    continue
+                m = re.fullmatch(r"(\w+)\.flipY ?= ?true", st)
+                if m and m.group(1) in extra:  # reflet (retourné, incliné) : pas encore dessinable, écarté
+                    reflections.add(m.group(1))
+                    continue
+                m = re.fullmatch(r"(\w+)\.cameras ?= ?\[(.*)\]", st)
+                if m and m.group(1) in extra and "camGame" not in m.group(2):  # autre caméra : effet à part, écarté
+                    reflections.add(m.group(1))
+                    continue
+                m = re.fullmatch(r"(\w+)\.([xy]) ?([-+])= ?" + NUM, st)
+                if m and m.group(1) in extra:  # décalage relatif dans create : appliqué à la position de départ
+                    i = 2 if m.group(2) == "x" else 3
+                    extra[m.group(1)][i] += float(m.group(4)) * (1 if m.group(3) == "+" else -1)
+                    continue
+                m = re.match(r"(\w+)\.", st)
+                if m and m.group(1) in extra:  # état initial (teinte, alpha, visible...) : pas -1000
+                    raw += [(-1000, op) for op in timeline_ops(st)]
+    for var in reflections:
+        del extra[var]
+    for i, var in enumerate(extra):  # indices 3, 4, 5 sans trou
+        extra[var][0] = 3 + i
+    for var, (k, nm, x, y, player, before) in extra.items():
+        char_lines.append(f"char {k} |{nm}| {x} {y} {1 if player else 0} {before}")
+    # délais en ms (minuteries) -> pas, au BPM du début ; puis un seul ordre chronologique (tri stable)
+    raw = [((e[0][1] * bpm / 15000.0) if isinstance(e[0], tuple) else e[0], e[1]) for e in raw]
+    raw.sort(key=lambda e: e[0])
+    # sprites qu'un événement fait apparaître, fenêtres d'affichage des shaders pré-calculés
+    keep = shown_by_events(raw)
+    windows = {}
+    for var, o in objects.items():
+        if isinstance(o, ScriptSprite) and o.shader:
+            evs = [(stp, op) for stp, op in raw if op[0] == "alpha" and op[1] == var]
+            on = next((stp for stp, op in evs if op[2] > 0), None)
+            if on is None:
+                continue
+            off = next((step_to_ms(stp, bpm, changes) + op[3] * 1000 for stp, op in evs if stp > on and op[2] <= 0),
+                       step_to_ms(on, bpm, changes) + 30000)
+            windows[var] = (step_to_ms(on, bpm, changes), off)
+    sname = re.sub(r"\W", "_", sid)
+    shader_cams = set()
+    for f, _ in files:
+        shader_cams |= set(re.findall(r"(\w+)\.(?:addShader|setFilters)\(",
+                                      f.read_text(encoding="utf-8-sig", errors="replace")))
+    records = build_script_items(objects, order, f"sng_{sname}_", 0, keep, windows, shader_cams)
+    order = [k for k in order if k[0] == "char" or k[1] in records]
+    ex = out / "extra.stg"
+    if records:
+        b = bytearray(b"FSTX") + struct.pack("<II", 3, len(records))
+        for i, (kind, v) in enumerate(order):
+            if kind != "spr":
+                continue
+            nxt = next((c for k2, c in order[i + 1:] if k2 == "char"), None)
+            r = dict(records[v])
+            r["before"] = BEFORE_CODE[nxt] if nxt and not r["layer"] else 255
+            b += pack_item(r)
+        ex.write_bytes(b)
+    else:
+        # fichier vide plutôt que supprimé : la copie vers la SD (FTP, robocopy) n'efface pas les anciens fichiers
+        ex.write_bytes(b"FSTX" + struct.pack("<II", 3, 0))
+    spr_names = dict(stage_vars)
+    spr_names.update({k: r["name"] for k, r in records.items()})
+    # qui est "dad" / "boyfriend" à chaque instant : "dad = shadum" change la cible des instructions suivantes
+    bind = {"boyfriend": 0, "bf": 0, "dad": 1, "gf": 2, "girlfriend": 2}
+    bind.update({v: e[0] for v, e in extra.items()})
+    slot_of_name = {"boyfriend": 0, "bf": 0, "dad": 1, "gf": 2, "girlfriend": 2}
+    lines = list(char_lines)
+    for stp, op in sorted(raw, key=lambda e: e[0]):
+        kind = op[0]
+        if kind == "flash":
+            lines.append(f"ev {stp} flash {op[1]:08X} {op[2]}")
+            continue
+        if kind == "assign":
+            k = bind.get(op[2])
+            if k is not None:
+                lines.append(f"ev {stp} sing {slot_of_name[op[1]]} {k}")
+                bind[op[1]] = k
+                if op[1] in ("boyfriend", "bf"):
+                    bind["boyfriend"] = bind["bf"] = k
+            continue
+        tgt = f"@{bind[op[1]]}" if op[1] in bind else spr_names.get(op[1])
+        if tgt is None:
+            continue
+        if kind == "alpha":
+            lines.append(f"ev {stp} alpha {tgt} {op[2]} {op[3]}")
+        elif kind == "tint" and tgt.startswith("@"):
+            lines.append(f"ev {stp} tint {tgt} {op[2]} 0")
+        elif kind == "move" and tgt.startswith("@"):
+            x = 1e30 if op[2] is None else op[2]
+            y = 1e30 if op[3] is None else op[3]
+            lines.append(f"ev {stp} move {tgt} {x} {y} {op[4]}")
+        elif kind == "flip" and tgt.startswith("@"):
+            lines.append(f"ev {stp} flip {tgt} {1 if op[2] else 0}")
+        elif kind == "vis":
+            lines.append(f"ev {stp} vis {tgt} {1 if op[2] else 0}")
+    return lines
 
 
 def song_fixes(song_dir, stage, ctx):
@@ -1131,27 +1553,31 @@ def convert_song(song_dir, chars_done, stages_done, chart_p):
         return res
 
     # toutes les lignes jouées par le joueur (type 1) d'un côté, toutes les lignes CPU de l'autre ;
-    # chanteur : 0 perso du côté, 3 emplacement gf, 4 perso de l'autre côté, 2 personne (perso non chargé)
+    # chanteur : 0 perso du côté, 3 emplacement gf, 4 perso de l'autre côté, 2 personne (perso non chargé).
+    # Une ligne de type 2 (ADDITIONAL) a ses propres flèches sur PC (souvent cachées ou déplacées par un script) :
+    # ses notes font chanter son perso mais ne s'affichent pas sur les flèches de l'adversaire (bit 0x80).
     nd, nb = [], []
     for idx, s in enumerate(lines):
         t = s.get("type", 0)
         side = 1 if t == 1 else 0
         sl = idx if idx < 3 else None
         notes = notes_of(s)
+        if t == 2:
+            notes = [(a, l, c | 0x80, h) for a, l, c, h in notes]
         if sl == side:
             pass
         elif sl == 2:
-            notes = [(a, l, 3, h) for a, l, _, h in notes]
+            notes = [(a, l, 3 | (c & 0x80), h) for a, l, c, h in notes]
         elif sl is not None:
-            notes = [(a, l, 4, h) for a, l, _, h in notes]
+            notes = [(a, l, 4 | (c & 0x80), h) for a, l, c, h in notes]
         else:
-            notes = [(a, l, 2, h) for a, l, _, h in notes]
+            notes = [(a, l, 2 | (c & 0x80), h) for a, l, c, h in notes]
         (nb if side else nd).extend(notes)
 
     def dedupe(ns):  # lignes parallèles : une seule note par instant et par flèche
         out, seen = [], set()
         for n in sorted(ns):
-            k = (round(n[0]), n[1])
+            k = (round(n[0]), n[1], n[2] & 0x80)
             if k not in seen:
                 seen.add(k)
                 out.append(n)
@@ -1186,12 +1612,14 @@ def convert_song(song_dir, chars_done, stages_done, chart_p):
         if p[0] == "camfix":  # indice de ligne de notes -> emplacement (0 adversaire, 1 joueur, 2 gf)
             p[1] = str(slot_of(int(p[1])))
         fixes.append(" ".join(p))
+    fixes += song_extras(song_dir, stage, sid, out, bpm, [(t, v) for t, k, v in events if k == 1], fixes,
+                         names, chars_done)
     fx = out / "fix.txt"
     if fixes:
         fx.write_text("\n".join(fixes) + "\n", encoding="ascii")
         print("  script:", "; ".join(fixes))
-    elif fx.exists():
-        fx.unlink()
+    else:
+        fx.write_text("", encoding="ascii")  # vide plutôt que supprimé (voir extra.stg)
 
     songf = song_dir / "song"
     inst = songf / f"Inst-{diff}.ogg"
