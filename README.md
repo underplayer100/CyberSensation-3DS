@@ -64,7 +64,8 @@ Pick **one** of these:
 
 Your console needs `sdmc:/3ds/dspfirm.cdc` for sound (dump it with DSP1).
 If both exist, the SD card data is used before the data inside the full `.cia`.
-Updating from v1.0/v1.1: delete `sdmc:/3ds/fnf3ds/cyber/` first if you switch to the full `.cia`.
+Updating with the SD card version: unzip the new `CyberSensation-3DS-SD.zip` over the old files (replace them).
+Switching to the full `.cia`: delete `sdmc:/3ds/fnf3ds/cyber/` first.
 
 ## Converting the mod
 Only needed to make the game files yourself (for example after a mod update). Players can use the release packs.
