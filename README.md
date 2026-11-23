@@ -147,9 +147,6 @@ Found by playing every song in the Azahar emulator (`tools/test_all.ps1`) and co
 - Special notes (hurt, bullet, and so on) are played as normal notes.
 - The ~2000 `HScript Call` chart events (lyrics, flashes, camera tricks) are ignored.
 
-**Not tested yet**
-- The full `.cia` (data in the romfs) has not been tested on a real console.
-
 ## Credits
 - **Friday Night Funkin'** by ninjamuffin99, PhantomArcade, evilsk8r and Kawai Sprite
 - **Codename Engine** by the Codename Crew
